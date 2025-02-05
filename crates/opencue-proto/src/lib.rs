@@ -53,38 +53,25 @@ impl WithUuid for show::Show {
     }
 }
 
+impl WithUuid for report::RunningFrameInfo {
+    fn uuid(&self) -> Uuid {
+        to_uuid(&self.frame_id).expect("Failed to convert Uuid, protocol version is incompatible")
+    }
+}
+
 pub fn to_uuid(stringified_id_from_protobuf: &str) -> Option<Uuid> {
     Uuid::parse_str(stringified_id_from_protobuf).ok()
 }
 
-impl From<Frame> for RunFrame {
-    fn from(value: Frame) -> Self {
-        RunFrame {
-            resource_id: todo!(),
-            job_id: todo!(),
-            job_name: todo!(),
-            frame_id: todo!(),
-            frame_name: todo!(),
-            layer_id: todo!(),
-            command: todo!(),
-            user_name: todo!(),
-            log_dir: todo!(),
-            show: todo!(),
-            shot: todo!(),
-            job_temp_dir: todo!(),
-            frame_temp_dir: todo!(),
-            log_file: todo!(),
-            log_dir_file: todo!(),
-            start_time: todo!(),
-            num_cores: todo!(),
-            gid: todo!(),
-            ignore_nimby: todo!(),
-            environment: todo!(),
-            attributes: todo!(),
-            num_gpus: todo!(),
-            children: todo!(),
-            uid_optional: todo!(),
-        }
+impl RunFrame {
+    pub fn job_id(&self) -> Uuid {
+        to_uuid(&self.job_id).expect("Failed to convert Uuid, protocol version is incompatible")
+    }
+    pub fn frame_id(&self) -> Uuid {
+        to_uuid(&self.frame_id).expect("Failed to convert Uuid, protocol version is incompatible")
+    }
+    pub fn layer_id(&self) -> Uuid {
+        to_uuid(&self.layer_id).expect("Failed to convert Uuid, protocol version is incompatible")
     }
 }
 

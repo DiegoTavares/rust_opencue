@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use crate::frame_thread::FrameThread;
+use crate::running_frame::RunningFrame;
 use crate::running_frame::RunningFrameCache;
 use crate::servant::Result;
+use miette::miette;
 use opencue_proto::rqd::{
     rqd_interface_server::RqdInterface, RqdStaticGetRunFrameRequest, RqdStaticGetRunFrameResponse,
     RqdStaticGetRunningFrameStatusRequest, RqdStaticGetRunningFrameStatusResponse,
@@ -56,17 +57,26 @@ impl RqdInterface for RqdServant {
     ) -> Result<Response<RqdStaticKillRunningFrameResponse>> {
         todo!()
     }
+
     /// Launch a new running frame
     async fn launch_frame(
         &self,
         request: Request<RqdStaticLaunchFrameRequest>,
     ) -> Result<Response<RqdStaticLaunchFrameResponse>> {
-        let t = tokio::task::spawn_blocking(|| {
-            let frame_thread = FrameThread {};
-            frame_thread.run()
-        });
-        todo!("t should be awaited and handled")
+        if let Some(run_frame) = request.into_inner().run_frame {
+            let running_frame: Arc<RunningFrame> = Arc::new(run_frame.into());
+            self.running_frame_cache
+                .insert_running_frame(Arc::clone(&running_frame));
+
+            // Fire and forget
+            let _t = tokio::task::spawn_blocking(move || {
+                running_frame.run();
+            });
+        }
+        // Don't wait for frame to complete to return a response
+        Ok(Response::new(RqdStaticLaunchFrameResponse {}))
     }
+
     /// Lock a number of cores
     async fn lock(
         &self,
