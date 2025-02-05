@@ -64,19 +64,22 @@ impl RqdInterface for RqdServant {
         &self,
         request: Request<RqdStaticLaunchFrameRequest>,
     ) -> Result<Response<RqdStaticLaunchFrameResponse>> {
-        if let Some(run_frame) = request.into_inner().run_frame {
-            let running_frame: Arc<RunningFrame> = Arc::new(run_frame.into());
-            self.running_frame_cache
-                .insert_running_frame(Arc::clone(&running_frame));
+        let run_frame = request
+            .into_inner()
+            .run_frame
+            .ok_or_else(|| tonic::Status::invalid_argument("Missing run_frame in request"))?;
 
-            // Fire and forget
-            let _t = tokio::task::spawn_blocking(move || {
-                if let Err(e) = catch_unwind(|| running_frame.run()) {
-                    error!("Panicked while trying to run a frame {:?}", e);
-                }
-                running_frame.run();
-            });
-        }
+        let running_frame: Arc<RunningFrame> = Arc::new(run_frame.into());
+        self.running_frame_cache
+            .insert_running_frame(Arc::clone(&running_frame));
+
+        // Fire and forget
+        let _t = tokio::task::spawn_blocking(move || {
+            if let Err(e) = catch_unwind(|| running_frame.run()) {
+                error!("Panicked while trying to run a frame {:?}", e);
+                // TODO: Trigger frame clean up logic
+            }
+        });
         // Don't wait for frame to complete to return a response
         Ok(Response::new(RqdStaticLaunchFrameResponse {}))
     }

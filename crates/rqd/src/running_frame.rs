@@ -67,7 +67,7 @@ impl Default for FrameStats {
             children: None,
             epoch_start_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_else(|_| std::time::Duration::from_secs(0))
                 .as_secs(),
         }
     }
