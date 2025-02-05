@@ -1,5 +1,4 @@
 use core::fmt;
-use std::path::Display;
 
 use host::Host;
 use job::{Frame, Job};
@@ -31,31 +30,31 @@ pub trait WithUuid {
 
 impl WithUuid for job::Job {
     fn uuid(&self) -> Uuid {
-        to_uuid(&self.id).expect("Failed to convert Uuid, protocol version is incompatible")
+        to_uuid(&self.id).unwrap_or(Uuid::nil())
     }
 }
 
 impl WithUuid for job::Layer {
     fn uuid(&self) -> Uuid {
-        to_uuid(&self.id).expect("Failed to convert Uuid, protocol version is incompatible")
+        to_uuid(&self.id).unwrap_or(Uuid::nil())
     }
 }
 
 impl WithUuid for facility::Allocation {
     fn uuid(&self) -> Uuid {
-        to_uuid(&self.id).expect("Failed to convert Uuid, protocol version is incompatible")
+        to_uuid(&self.id).unwrap_or(Uuid::nil())
     }
 }
 
 impl WithUuid for show::Show {
     fn uuid(&self) -> Uuid {
-        to_uuid(&self.id).expect("Failed to convert Uuid, protocol version is incompatible")
+        to_uuid(&self.id).unwrap_or(Uuid::nil())
     }
 }
 
 impl WithUuid for report::RunningFrameInfo {
     fn uuid(&self) -> Uuid {
-        to_uuid(&self.frame_id).expect("Failed to convert Uuid, protocol version is incompatible")
+        to_uuid(&self.frame_id).unwrap_or(Uuid::nil())
     }
 }
 
@@ -65,13 +64,13 @@ pub fn to_uuid(stringified_id_from_protobuf: &str) -> Option<Uuid> {
 
 impl RunFrame {
     pub fn job_id(&self) -> Uuid {
-        to_uuid(&self.job_id).expect("Failed to convert Uuid, protocol version is incompatible")
+        to_uuid(&self.job_id).unwrap_or(Uuid::nil())
     }
     pub fn frame_id(&self) -> Uuid {
-        to_uuid(&self.frame_id).expect("Failed to convert Uuid, protocol version is incompatible")
+        to_uuid(&self.frame_id).unwrap_or(Uuid::nil())
     }
     pub fn layer_id(&self) -> Uuid {
-        to_uuid(&self.layer_id).expect("Failed to convert Uuid, protocol version is incompatible")
+        to_uuid(&self.layer_id).unwrap_or(Uuid::nil())
     }
 }
 

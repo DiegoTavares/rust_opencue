@@ -120,6 +120,13 @@ impl From<RunFrame> for RunningFrame {
         let job_id = run_frame.job_id();
         let frame_id = run_frame.frame_id();
         let layer_id = run_frame.layer_id();
+        let log_path = std::path::Path::new(&run_frame.log_dir)
+            .join(format!(
+                "{}.{}.rqlog",
+                run_frame.job_name, run_frame.frame_name
+            ))
+            .to_string_lossy()
+            .to_string();
         RunningFrame {
             resource_id: run_frame.resource_id,
             job_id,
@@ -132,10 +139,7 @@ impl From<RunFrame> for RunningFrame {
             show: run_frame.show,
             shot: run_frame.shot,
             frame_temp_dir: run_frame.frame_temp_dir,
-            log_path: format!(
-                "{}/{}.{}.rqlog",
-                run_frame.log_dir, run_frame.job_name, run_frame.frame_name
-            ),
+            log_path,
             num_cores: run_frame.num_cores,
             gid: run_frame.gid,
             ignore_nimby: run_frame.ignore_nimby,
@@ -162,7 +166,8 @@ impl RunningFrameCache {
         })
     }
 
-    /// Clones the contents of the cache into a vector
+    /// Clones the contents of the cache into a vector. This method is potentially expensive,
+    /// it should only be used when a snapshot of the current state is required
     pub fn into_running_frame_vec(&self) -> Vec<RunningFrameInfo> {
         self.cache
             .iter()

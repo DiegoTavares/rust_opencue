@@ -1,9 +1,9 @@
+use std::panic::catch_unwind;
 use std::sync::Arc;
 
 use crate::running_frame::RunningFrame;
 use crate::running_frame::RunningFrameCache;
 use crate::servant::Result;
-use miette::miette;
 use opencue_proto::rqd::{
     rqd_interface_server::RqdInterface, RqdStaticGetRunFrameRequest, RqdStaticGetRunFrameResponse,
     RqdStaticGetRunningFrameStatusRequest, RqdStaticGetRunningFrameStatusResponse,
@@ -20,6 +20,7 @@ use opencue_proto::rqd::{
     RqdStaticUnlockResponse,
 };
 use tonic::{async_trait, Request, Response};
+use tracing::error;
 
 /// Servant for the grpc Rqd interface
 pub struct RqdServant {
@@ -70,6 +71,9 @@ impl RqdInterface for RqdServant {
 
             // Fire and forget
             let _t = tokio::task::spawn_blocking(move || {
+                if let Err(e) = catch_unwind(|| running_frame.run()) {
+                    error!("Panicked while trying to run a frame {:?}", e);
+                }
                 running_frame.run();
             });
         }
