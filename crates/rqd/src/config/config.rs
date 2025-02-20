@@ -87,12 +87,14 @@ impl Default for MachineConfig {
 #[serde(default)]
 pub struct RunnerConfig {
     pub run_on_docker: bool,
+    pub default_uid: u32,
 }
 
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
             run_on_docker: false,
+            default_uid: 1000,
         }
     }
 }

@@ -9,6 +9,7 @@ use monitor::system::MachineMonitor;
 use report_client::ReportClient;
 use running_frame::RunningFrameCache;
 use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
+use tracing::error;
 use tracing_rolling_file::{RollingConditionBase, RollingFileAppenderBase};
 
 mod config;
@@ -63,7 +64,11 @@ async fn main() -> miette::Result<()> {
         diskinfo,
     )?);
     let mm_clone = Arc::clone(&machine_monitor);
-    tokio::spawn(async move { machine_monitor.start().await });
+    tokio::spawn(async move {
+        if let Err(e) = machine_monitor.start().await {
+            panic!("MachineMonitor loop crashed. {e}")
+        }
+    });
 
     // Initialize rqd grpc servant
     servant::serve(config, Arc::clone(&running_frame_cache), mm_clone)

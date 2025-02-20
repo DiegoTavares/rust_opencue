@@ -27,15 +27,22 @@ pub struct RunningFrame {
     pub num_gpus: u32,
     pub frame_temp_dir: String,
     pub log_path: String,
-    pub uid: Option<i32>,
-    pub gid: i32,
+    pub requested_uid: Option<u32>,
+    pub gid: u32,
     pub ignore_nimby: bool,
     pub environment: HashMap<String, String>,
     /// additional data can be provided about the running frame
     pub attributes: HashMap<String, String>,
     pub frame_stats: Option<FrameStats>,
-    pub cpu_list: Option<Vec<u32>>,
-    pub gpu_list: Option<Vec<u32>>,
+    initialized_resources: Option<InitializedResources>,
+}
+
+#[derive(Clone)]
+struct InitializedResources {
+    pub uid: u32,
+    pub config: RunnerConfig,
+    pub cpu_list: Vec<u32>,
+    pub gpu_list: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -81,7 +88,7 @@ impl Default for FrameStats {
 
 impl RunningFrame {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub fn run(&self, config: &RunnerConfig) -> Result<()> {
+    pub fn run(&self) -> Result<()> {
         // Windows, Linux or Docker
         // Setup:
         //  - tmp dir
@@ -89,28 +96,19 @@ impl RunningFrame {
         //  - check and create user
         //  - Create log stream
 
-        if config.run_on_docker {
-            return self.run_on_docker(config);
-        }
-
-        // Create user if required
-        if let Some(uid) = self.uid {
-            self.ensure_user_exists(&self.user_name, uid, self.gid)?;
+        if self.resources().config.run_on_docker {
+            return self.run_on_docker();
         }
 
         todo!()
     }
 
-    fn ensure_user_exists(&self, username: &str, uid: i32, gid: i32) -> Result<()> {
-        todo!()
-    }
-
-    pub fn run_on_docker(&self, config: &RunnerConfig) -> Result<()> {
+    pub fn run_on_docker(&self) -> Result<()> {
         todo!()
     }
 
     #[cfg(target_os = "windows")]
-    pub fn run(&self, config: &RunnerConfig) {
+    pub fn run(&self) {
         todo!("Windows runner needs to be implemented")
     }
 
@@ -118,10 +116,26 @@ impl RunningFrame {
         todo!()
     }
 
-    pub fn with_resources(self, cpu_list: Vec<u32>, gpu_list: Vec<u32>) -> Self {
+    fn resources(&self) -> &InitializedResources {
+        self.initialized_resources.as_ref().expect(
+            "Running Frame should have initialized resources at this point. Unexpected behaviour!",
+        )
+    }
+
+    pub fn with_resources(
+        self,
+        config: RunnerConfig,
+        uid: u32,
+        cpu_list: Vec<u32>,
+        gpu_list: Vec<u32>,
+    ) -> Self {
         RunningFrame {
-            cpu_list: Some(cpu_list),
-            gpu_list: Some(gpu_list),
+            initialized_resources: Some(InitializedResources {
+                uid,
+                config,
+                cpu_list,
+                gpu_list,
+            }),
             ..self
         }
     }
@@ -179,17 +193,16 @@ impl From<RunFrame> for RunningFrame {
             frame_temp_dir: run_frame.frame_temp_dir,
             log_path,
             num_cores: run_frame.num_cores as u32,
-            uid: run_frame.uid_optional.map(|optional| match optional {
-                opencue_proto::rqd::run_frame::UidOptional::Uid(uid) => uid,
+            requested_uid: run_frame.uid_optional.map(|optional| match optional {
+                opencue_proto::rqd::run_frame::UidOptional::Uid(uid) => uid as u32,
             }),
-            gid: run_frame.gid,
+            gid: run_frame.gid as u32,
             ignore_nimby: run_frame.ignore_nimby,
             environment: run_frame.environment,
             attributes: run_frame.attributes,
             num_gpus: run_frame.num_gpus as u32,
             frame_stats: None,
-            cpu_list: None,
-            gpu_list: None,
+            initialized_resources: None,
         }
     }
 }

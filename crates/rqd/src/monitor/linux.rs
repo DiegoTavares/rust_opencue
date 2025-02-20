@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader},
     net::ToSocketAddrs,
+    process::Command,
     sync::{Arc, Mutex},
 };
 
@@ -10,6 +11,7 @@ use itertools::Itertools;
 use miette::{miette, IntoDiagnostic, Result};
 use opencue_proto::host::HardwareState;
 use sysinfo::{DiskRefreshKind, Disks, System};
+use uuid::Uuid;
 
 use crate::config::config::MachineConfig;
 
@@ -586,6 +588,39 @@ impl SystemController for LinuxSystem {
         );
 
         Ok(selected_cores)
+    }
+
+    fn create_user_if_unexisting(&self, username: &str, uid: u32, gid: u32) -> Result<u32> {
+        // First check if the user already exists
+        if let Some(user) = users::get_user_by_name(username) {
+            return Ok(user.uid());
+        }
+
+        // User doesn't exist, create it using useradd
+        let output = Command::new("useradd")
+            .arg("-p")
+            .arg(Uuid::new_v4().to_string())
+            .arg("--uid")
+            .arg(uid.to_string())
+            .arg("--gid")
+            .arg(gid.to_string())
+            .arg(username)
+            .output()
+            .into_diagnostic()?;
+
+        if !output.status.success() {
+            return Err(miette!(
+                "Failed to create user {}: {}",
+                username,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        // Verify the user was created
+        match users::get_user_by_name(username) {
+            Some(user) => Ok(user.uid()),
+            None => Err(miette!("Failed to verify user {} was created", username)),
+        }
     }
 }
 

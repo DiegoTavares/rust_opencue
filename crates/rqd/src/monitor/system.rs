@@ -188,6 +188,8 @@ pub trait Machine {
     ///
     /// List of gpu units
     async fn reserve_gpus(&self, num_gpus: u32) -> Result<Vec<u32>>;
+
+    async fn create_user_if_unexisting(&self, username: &str, uid: u32, gid: u32) -> Result<u32>;
 }
 
 #[async_trait]
@@ -216,6 +218,11 @@ impl Machine for MachineMonitor {
 
     async fn reserve_gpus(&self, num_gpus: u32) -> Result<Vec<u32>> {
         todo!()
+    }
+
+    async fn create_user_if_unexisting(&self, username: &str, uid: u32, gid: u32) -> Result<u32> {
+        let stats_collector = self.system_controller.lock().await;
+        stats_collector.create_user_if_unexisting(username, uid, gid)
     }
 }
 
@@ -291,6 +298,9 @@ pub trait SystemController {
 
     /// Release a core
     fn release_core(&mut self, core_id: &u32) -> Result<(), ReservationError>;
+
+    /// Creates an user if it doesn't already exist
+    fn create_user_if_unexisting(&self, username: &str, uid: u32, gid: u32) -> Result<u32>;
 }
 
 #[derive(Debug, Clone, Diagnostic, Error)]

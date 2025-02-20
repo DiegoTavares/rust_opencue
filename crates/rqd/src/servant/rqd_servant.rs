@@ -56,10 +56,10 @@ impl RqdServant {
             )))?
         }
         // Trying to run as root
-        if running_frame.uid.unwrap_or(1) <= 0 {
+        if running_frame.requested_uid.unwrap_or(1) <= 0 {
             Err(tonic::Status::invalid_argument(format!(
                 "Not launching, will not run frame as uid = {}",
-                running_frame.uid.unwrap_or(1)
+                running_frame.requested_uid.unwrap_or(1)
             )))?
         }
         // Invalid number of cores
@@ -170,17 +170,36 @@ impl RqdInterface for RqdServant {
                 })?,
         };
 
+        // Create user if required. uid and gid ranges have already been verified
+        let uid = match running_frame.requested_uid {
+            Some(uid) => self
+                .machine
+                .create_user_if_unexisting(&running_frame.user_name, uid, running_frame.gid)
+                .await
+                .map_err(|err| {
+                    tonic::Status::aborted(format!(
+                        "Not launching, user {}({}:{}) could not be created. {:?}",
+                        running_frame.user_name, uid, running_frame.gid, err
+                    ))
+                })?,
+            None => self.config.runner.default_uid,
+        };
+
         // Update resource values on running_frame
-        let running_frame = Arc::new(running_frame.with_resources(cpu_list, gpu_list));
+        let running_frame = Arc::new(running_frame.with_resources(
+            self.config.runner.clone(),
+            uid,
+            cpu_list,
+            gpu_list,
+        ));
 
         self.running_frame_cache
             .insert_running_frame(Arc::clone(&running_frame));
 
-        let config = self.config.runner.clone();
         // Fire and forget
         let _t = tokio::task::spawn_blocking(move || {
             if let Err(e) = catch_unwind(|| {
-                if let Err(e) = running_frame.run(&config) {
+                if let Err(e) = running_frame.run() {
                     error!("Failed to run frame {:?}", e);
                 }
             }) {
