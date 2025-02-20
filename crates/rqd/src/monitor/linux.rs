@@ -569,23 +569,22 @@ impl SystemController for LinuxSystem {
                 if selected_cores.len() >= count as usize {
                     break;
                 }
-                match self.reserve_core(phys_id.clone(), core_id) {
-                    Ok(_) => {
-                        selected_cores.push(core_id);
-                    }
-                    Err(_) => todo!(),
-                }
+                self.reserve_core(phys_id.clone(), core_id)?;
+                selected_cores.push(core_id);
             }
         }
 
-        // Not having all cores reserved at this point is an unconsistent state, as we have
-        // initially checked if there are cores availabLe for this reservation
+        // Not having all cores reserved at this point is an unconsistent state, as it has been
+        // initially checked if the system had enough cores for this reservation
         assert_eq!(
             count,
             selected_cores.len() as u32,
             "Not having all cores reserved at this point is an unconsistent state, as we haves
             initially checked if there are cores availabLe for this reservation"
         );
+        if count != selected_cores.len() as u32 {
+            Err(ReservationError::NotEnoughResourcesAvailable)?
+        }
 
         Ok(selected_cores)
     }
