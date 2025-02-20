@@ -535,32 +535,35 @@ impl SystemController for LinuxSystem {
         if count > self.cpu_stat.available_cores {
             Err(ReservationError::NotEnoughResourcesAvailable)?
         }
-        let mut selected_cores = Vec::new();
+        let mut selected_cores = Vec::with_capacity(count as usize);
         let reserved_cores = &self.cpu_stat.reserved_cores_by_physid;
         let all_cores_map = self.procid_by_physid_and_core_id.clone();
 
         // Iterate over all phys_id=>core_id's and filter out cores that have been reserved
         let available_cores = all_cores_map
-            .iter()
-            .map(|(k, v)| (k, v.keys()))
-            .filter_map(|(phys_id, core_ids)| match reserved_cores.get(phys_id) {
-                Some(reserved_core_ids) => {
-                    // Filter out cores that are present in any of the sockets on the
-                    // reserved_cores map
-                    let available_cores: Vec<u32> = core_ids
-                        .cloned()
-                        .filter(|core_id| !reserved_core_ids.contains(core_id))
-                        .collect();
-                    // Filter out sockets that are completelly reserved
-                    if available_cores.len() > 0 {
-                        Some((phys_id, available_cores))
-                    } else {
-                        None
+            .into_iter()
+            // .map(|(k, v)| (k, v.keys()))
+            .filter_map(
+                |(phys_id, core_ids_map)| match reserved_cores.get(&phys_id) {
+                    Some(reserved_core_ids) => {
+                        // Filter out cores that are present in any of the sockets on the
+                        // reserved_cores map
+                        let available_cores: Vec<u32> = core_ids_map
+                            .keys()
+                            .cloned()
+                            .filter(|core_id| !reserved_core_ids.contains(core_id))
+                            .collect();
+                        // Filter out sockets that are completelly reserved
+                        if available_cores.len() > 0 {
+                            Some((phys_id, available_cores))
+                        } else {
+                            None
+                        }
                     }
-                }
-                // If the phys_id doesn't on the reserved_cores map, consider the sockets available
-                None => Some((phys_id, core_ids.cloned().collect())),
-            })
+                    // If the phys_id doesn't on the reserved_cores map, consider the sockets available
+                    None => Some((phys_id, core_ids_map.keys().copied().collect())),
+                },
+            )
             // Sort sockets with more available cores first
             .sorted_by(|a, b| Ord::cmp(&b.1.len(), &a.1.len()));
 
@@ -569,7 +572,7 @@ impl SystemController for LinuxSystem {
                 if selected_cores.len() >= count as usize {
                     break;
                 }
-                self.reserve_core(phys_id.clone(), core_id)?;
+                self.reserve_core(phys_id, core_id)?;
                 selected_cores.push(core_id);
             }
         }
