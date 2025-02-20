@@ -91,9 +91,7 @@ impl RunningFrame {
     pub fn run(&self) -> Result<()> {
         // Windows, Linux or Docker
         // Setup:
-        //  - tmp dir
         //  - log path
-        //  - check and create user
         //  - Create log stream
 
         if self.resources().config.run_on_docker {

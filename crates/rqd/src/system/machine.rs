@@ -4,10 +4,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use miette::{miette, Diagnostic, IntoDiagnostic, Result};
+use miette::{Diagnostic, IntoDiagnostic, Result};
 use opencue_proto::{
     host::HardwareState,
-    report::{CoreDetail, CoreId, RenderHost},
+    report::{CoreDetail, RenderHost},
 };
 use sysinfo::{Disks, System};
 use thiserror::Error;
@@ -17,10 +17,9 @@ use tracing::debug;
 use crate::{
     config::config::{Config, MachineConfig},
     report_client::{ReportClient, ReportInterface},
-    running_frame::RunningFrameCache,
 };
 
-use super::linux::LinuxSystem;
+use super::{linux::LinuxSystem, running_frame::RunningFrameCache};
 
 type SystemControllerType = Box<dyn SystemController + Sync + Send>;
 

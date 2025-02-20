@@ -2,10 +2,9 @@ use std::panic::catch_unwind;
 use std::sync::Arc;
 
 use crate::config::config::Config;
-use crate::monitor::system::Machine;
-use crate::running_frame::RunningFrame;
-use crate::running_frame::RunningFrameCache;
 use crate::servant::Result;
+use crate::system::machine::Machine;
+use crate::system::running_frame::{RunningFrame, RunningFrameCache};
 use opencue_proto::host::HardwareState;
 use opencue_proto::rqd::{
     rqd_interface_server::RqdInterface, RqdStaticGetRunFrameRequest, RqdStaticGetRunFrameResponse,
@@ -185,7 +184,6 @@ impl RqdInterface for RqdServant {
             None => self.config.runner.default_uid,
         };
 
-        // Update resource values on running_frame
         let running_frame = Arc::new(running_frame.with_resources(
             self.config.runner.clone(),
             uid,
