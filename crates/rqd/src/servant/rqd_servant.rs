@@ -1,8 +1,9 @@
 use std::panic::catch_unwind;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::config::config::Config;
 use crate::servant::Result;
+use crate::system::logging::FrameFileLogger;
 use crate::system::machine::Machine;
 use crate::system::running_frame::{RunningFrame, RunningFrameCache};
 use opencue_proto::host::HardwareState;
@@ -147,34 +148,47 @@ impl RqdInterface for RqdServant {
         self.validate_frame(&run_frame)?;
         self.validate_machine_state(run_frame.ignore_nimby).await?;
 
-        // On cuebot, num_cores are multiplied by 100 to account for fractional reservations
-        // rqd doesn't follow the same concept
-        let cpu_request = run_frame.num_cores as u32 / 100;
-        let cpu_list = self
-            .machine
-            .reserve_cpus(cpu_request)
-            .await
-            .map_err(|err| {
-                tonic::Status::aborted(format!(
-                    "Not launching, failed to reserve cpu resources {:?}",
-                    err
-                ))
-            })?;
+        // Cuebot unfortunatelly uses a hardcoded frame environment variable to signal if
+        // a frame is hyperthreaded. Rqd should only reserve cores if a frame is hyperthreaded.
+        let hyperthreaded = run_frame
+            .environment
+            .get("CUE_THREADABLE")
+            .map_or(false, |v| v == "1");
+        let cpu_list = match hyperthreaded {
+            true => {
+                // On cuebot, num_cores are multiplied by 100 to account for fractional reservations
+                // rqd doesn't follow the same concept
+                let cpu_request = run_frame.num_cores as u32 / 100;
+                Some(
+                    self.machine
+                        .reserve_cpus(cpu_request)
+                        .await
+                        .map_err(|err| {
+                            tonic::Status::aborted(format!(
+                                "Not launching, failed to reserve cpu resources {:?}",
+                                err
+                            ))
+                        })?,
+                )
+            }
+            false => None,
+        };
 
         // Although num_gpus is not required on a frame, the field is not optional on the proto
         // layer. =0 means None, !=0 means Some
         let gpu_list = match run_frame.num_gpus {
-            0 => Vec::new(),
-            _ => self
-                .machine
-                .reserve_gpus(run_frame.num_gpus as u32)
-                .await
-                .map_err(|err| {
-                    tonic::Status::aborted(format!(
-                        "Not launching, insufficient resources {:?}",
-                        err
-                    ))
-                })?,
+            0 => None,
+            _ => Some(
+                self.machine
+                    .reserve_gpus(run_frame.num_gpus as u32)
+                    .await
+                    .map_err(|err| {
+                        tonic::Status::aborted(format!(
+                            "Not launching, insufficient resources {:?}",
+                            err
+                        ))
+                    })?,
+            ),
         };
 
         // Create user if required. uid and gid ranges have already been verified
@@ -200,6 +214,7 @@ impl RqdInterface for RqdServant {
             self.config.runner.clone(),
             cpu_list,
             gpu_list,
+            self.machine.get_host_name().await,
         ));
 
         self.running_frame_cache

@@ -189,6 +189,8 @@ pub trait Machine {
     async fn reserve_gpus(&self, num_gpus: u32) -> Result<Vec<u32>>;
 
     async fn create_user_if_unexisting(&self, username: &str, uid: u32, gid: u32) -> Result<u32>;
+
+    async fn get_host_name(&self) -> String;
 }
 
 #[async_trait]
@@ -222,6 +224,14 @@ impl Machine for MachineMonitor {
     async fn create_user_if_unexisting(&self, username: &str, uid: u32, gid: u32) -> Result<u32> {
         let stats_collector = self.system_controller.lock().await;
         stats_collector.create_user_if_unexisting(username, uid, gid)
+    }
+
+    async fn get_host_name(&self) -> String {
+        let lock = self.host_state.lock().await;
+
+        lock.as_ref()
+            .map(|h| h.name.clone())
+            .unwrap_or("noname".to_string())
     }
 }
 

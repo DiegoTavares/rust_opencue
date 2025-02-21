@@ -1,7 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, env, sync::Arc};
 
 use dashmap::DashMap;
-use miette::{miette, IntoDiagnostic, Result};
+use miette::{miette, Result};
 use opencue_proto::{
     report::{ChildrenProcStats, RunningFrameInfo},
     rqd::RunFrame,
@@ -9,6 +9,8 @@ use opencue_proto::{
 use uuid::Uuid;
 
 use crate::config::config::RunnerConfig;
+
+use super::logging::{FrameLogger, FrameLoggerT};
 
 /// Wrapper around protobuf message RunningFrameInfo
 #[derive(Clone)]
@@ -21,8 +23,10 @@ pub struct RunningFrame {
     log_path: String,
     uid: u32,
     config: RunnerConfig,
-    cpu_list: Vec<u32>,
-    gpu_list: Vec<u32>,
+    cpu_list: Option<Vec<u32>>,
+    gpu_list: Option<Vec<u32>>,
+    env_vars: HashMap<&'static str, String>,
+    hostname: String,
 }
 
 #[derive(Clone)]
@@ -71,8 +75,9 @@ impl RunningFrame {
         request: RunFrame,
         uid: u32,
         config: RunnerConfig,
-        cpu_list: Vec<u32>,
-        gpu_list: Vec<u32>,
+        cpu_list: Option<Vec<u32>>,
+        gpu_list: Option<Vec<u32>>,
+        hostname: String,
     ) -> Self {
         let job_id = request.job_id();
         let frame_id = request.frame_id();
@@ -81,6 +86,7 @@ impl RunningFrame {
             .join(format!("{}.{}.rqlog", request.job_name, request.frame_name))
             .to_string_lossy()
             .to_string();
+        let env_vars = Self::setup_env_vars(&config, &request, hostname.clone(), log_path.clone());
         RunningFrame {
             request,
             job_id,
@@ -92,19 +98,61 @@ impl RunningFrame {
             config,
             cpu_list,
             gpu_list,
+            env_vars,
+            hostname,
         }
+    }
+
+    fn setup_env_vars(
+        config: &RunnerConfig,
+        request: &RunFrame,
+        hostname: String,
+        log_path: String,
+    ) -> HashMap<&'static str, String> {
+        let path_env_var = match config.use_host_path_env_var {
+            true => env::var("PATH").unwrap_or("".to_string()),
+            false => Self::get_path_env_var().to_string(),
+        };
+        let mut env_vars = HashMap::new();
+        env_vars.insert("PATH", path_env_var);
+        env_vars.insert("TERM", "unknown".to_string());
+        env_vars.insert("USER", request.user_name.clone());
+        env_vars.insert("LOGNAME", request.user_name.clone());
+        env_vars.insert("mcp", "1".to_string());
+        env_vars.insert("show", request.show.clone());
+        env_vars.insert("shot", request.shot.clone());
+        env_vars.insert("jobid", request.job_name.clone());
+        env_vars.insert("jobhost", hostname);
+        env_vars.insert("frame", request.frame_name.clone());
+        env_vars.insert("zframe", request.frame_name.clone());
+        env_vars.insert("logfile", log_path);
+        env_vars.insert("maxframetime", "0".to_string());
+        env_vars.insert("minspace", "200".to_string());
+        env_vars.insert("CUE3", "True".to_string());
+        env_vars.insert("SP_NOMYCSHRC", "1".to_string());
+        env_vars
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn get_path_env_var() -> &'static str {
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn get_path_env_var() -> &'static str {
+        "C:/Windows/system32;C:/Windows;C:/Windows/System32/Wbem"
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn run(&self) -> Result<()> {
-        // Windows, Linux or Docker
-        // Setup:
-        //  - log path
-        //  - Create log stream
+        use crate::system::logging::{FrameLoggerBuilder, FrameLoggerT};
 
         if self.config.run_on_docker {
             return self.run_on_docker();
         }
+
+        let logger = FrameLoggerBuilder::fromLoggerConfig(self.log_path.clone(), &self.config)?;
+        logger.writeln(self.write_header().as_str());
 
         todo!()
     }
@@ -120,6 +168,52 @@ impl RunningFrame {
 
     pub fn kill(&self) {
         todo!()
+    }
+
+    fn write_header(&self) -> String {
+        let env_var_list = self
+            .env_vars
+            .iter()
+            .map(|(key, value)| format!("{key}               {value}"))
+            .reduce(|a, b| a + "\n" + b.as_str())
+            .unwrap_or("".to_string());
+        let hyperthread = match &self.cpu_list {
+            Some(cpu_list) => format!(
+                "Hyperthreading cores {}",
+                cpu_list
+                    .into_iter()
+                    .map(|v| format!("{}", v))
+                    .reduce(|a, b| a + ", " + b.as_str())
+                    .unwrap_or("".to_string())
+            ),
+            None => "Hyperthreading disabled".to_string(),
+        };
+        format!(
+            r#"
+====================================================================================================
+RenderQ JobSpec     {start_time}
+command             {command}
+uid                 {uid}
+gid                 {gid}
+log_path            {log_path}
+render_host         {hostname}
+job_id              {job_id}
+frame_id            {frame_id}
+{hyperthread}
+----------------------------------------------------------------------------------------------------
+Environment Variables:
+{env_var_list}
+====================================================================================================
+            "#,
+            start_time = "",
+            command = self.request.command,
+            uid = self.uid,
+            gid = self.request.gid,
+            log_path = self.log_path,
+            hostname = self.hostname,
+            job_id = self.job_id,
+            frame_id = self.frame_id,
+        )
     }
 }
 
