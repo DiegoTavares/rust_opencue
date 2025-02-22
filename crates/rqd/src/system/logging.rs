@@ -49,12 +49,19 @@ impl FrameFileLogger {
 
 impl FrameLoggerT for FrameFileLogger {
     fn writeln(&self, line: &str) {
-        let mut fd = self.file_descriptor.lock().unwrap();
-        if let Err(io_err) = fd
-            .write_all(line.as_bytes())
-            .and_then(|_| fd.write_all(b"\n"))
-        {
-            error!("Failed to write line to frame logger. {io_err:?}")
-        };
+        let mut line_with_newline = String::with_capacity(line.len() + 1);
+        line_with_newline.push_str(line);
+        line_with_newline.push('\n');
+        
+        match self.file_descriptor.lock() {
+            Ok(mut fd) => {
+                if let Err(io_err) = fd.write_all(line_with_newline.as_bytes()) {
+                    error!("Failed to write line to frame logger: {io_err}");
+                }
+            }
+            Err(poison_err) => {
+                error!("Failed to acquire lock: {poison_err}");
+            }
+        }
     }
 }
