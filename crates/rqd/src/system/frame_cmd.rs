@@ -17,7 +17,7 @@ impl FrameCmdBuilder {
     #[cfg(target_os = "windows")]
     pub fn new() -> Self {
         let mut cmd = Command::new("cmd.exe");
-        cmd.arg("-c");
+        cmd.arg("/c");
         Self { cmd }
     }
 
