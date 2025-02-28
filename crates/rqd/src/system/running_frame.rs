@@ -50,6 +50,7 @@ pub struct RunningFrame {
 
 pub struct RunningState {
     pid: Option<u32>,
+    exit_code: Option<i32>,
     launch_thread_handle: Option<JoinHandle<()>>,
 }
 impl RunningState {
@@ -57,6 +58,7 @@ impl RunningState {
         RunningState {
             pid: None,
             launch_thread_handle: None,
+            exit_code: None,
         }
     }
 }
@@ -171,6 +173,14 @@ impl RunningFrame {
         state.launch_thread_handle = Some(thread_handle);
     }
 
+    pub fn update_exit_code(&self, exit_code: i32) {
+        let mut state = self
+            .mutable_state
+            .lock()
+            .expect("Lock should be available for this thread.");
+        state.exit_code = Some(exit_code);
+    }
+
     fn update_pid(&self, pid: u32) {
         let mut state = self
             .mutable_state
@@ -227,10 +237,13 @@ impl RunningFrame {
             return;
         }
         let logger = Arc::new(logger_base.unwrap());
-        if let Err(error) = self.run_inner(Arc::clone(&logger)) {
-            let msg = format!("Frame {} failed to be spawned. {}", self.to_string(), error);
-            logger.writeln(&msg);
-            error!(msg);
+        match self.run_inner(Arc::clone(&logger)) {
+            Ok(exit_code) => self.update_exit_code(exit_code),
+            Err(err) => {
+                let msg = format!("Frame {} failed to be spawned. {}", self.to_string(), err);
+                logger.writeln(&msg);
+                error!(msg);
+            }
         }
     }
 
