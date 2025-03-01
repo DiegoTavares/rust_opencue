@@ -3,7 +3,7 @@ use std::{
     env,
     fmt::Display,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, BufWriter},
     os::{
         fd::{FromRawFd, IntoRawFd, RawFd},
         unix::process::CommandExt,
@@ -15,6 +15,7 @@ use std::{
 };
 use std::{process::Stdio, thread};
 
+use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
 use dashmap::DashMap;
@@ -30,27 +31,34 @@ use crate::config::config::RunnerConfig;
 use crate::system::{frame_cmd::FrameCmdBuilder, logging::FrameLoggerBuilder};
 
 /// Wrapper around protobuf message RunningFrameInfo
+#[derive(Serialize, Deserialize)]
 pub struct RunningFrame {
-    request: RunFrame,
-    job_id: Uuid,
-    frame_id: Uuid,
-    layer_id: Uuid,
-    frame_stats: Option<FrameStats>,
-    log_path: String,
-    uid: u32,
-    config: RunnerConfig,
-    cpu_list: Option<Vec<u32>>,
-    gpu_list: Option<Vec<u32>>,
-    env_vars: HashMap<String, String>,
-    hostname: String,
-    raw_stdout_path: String,
-    raw_stderr_path: String,
-    mutable_state: Arc<Mutex<RunningState>>,
+    pub request: RunFrame,
+    pub job_id: Uuid,
+    pub frame_id: Uuid,
+    pub layer_id: Uuid,
+    pub frame_stats: Option<FrameStats>,
+    pub log_path: String,
+    pub uid: u32,
+    pub config: RunnerConfig,
+    pub cpu_list: Option<Vec<u32>>,
+    pub gpu_list: Option<Vec<u32>>,
+    pub env_vars: HashMap<String, String>,
+    pub hostname: String,
+    pub raw_stdout_path: String,
+    pub raw_stderr_path: String,
+    #[serde(serialize_with = "serialize_running_state")]
+    #[serde(deserialize_with = "deserialize_running_state")]
+    pub mutable_state: Arc<Mutex<RunningState>>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct RunningState {
     pid: Option<u32>,
     exit_code: Option<i32>,
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    #[serde(default = "none_value")]
     launch_thread_handle: Option<JoinHandle<()>>,
 }
 impl RunningState {
@@ -63,7 +71,7 @@ impl RunningState {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FrameStats {
     /// Maximum resident set size (KB) - maximum amount of physical memory used.
     max_rss: u64,
@@ -245,6 +253,13 @@ impl RunningFrame {
                 error!(msg);
             }
         }
+        if let Err(err) = self.clear_snapshot() {
+            warn!(
+                "Failed to clear snapshot {}: {}",
+                self.snapshot_path().unwrap_or("empty_path".to_string()),
+                err
+            );
+        };
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -297,7 +312,7 @@ impl RunningFrame {
         );
 
         // Make sure process has been spawned before creating a backup
-        let _ = self.backup()?;
+        let _ = self.snapshot()?;
 
         let raw_stdout_path = self.raw_stdout_path.clone();
         let raw_stderr_path = self.raw_stderr_path.clone();
@@ -414,9 +429,59 @@ impl RunningFrame {
         Ok(())
     }
 
-    fn backup(&self) -> Result<()> {
-        // TODO
+    fn snapshot_path(&self) -> Result<String> {
+        let pid = self
+            .mutable_state
+            .lock()
+            .map_err(|err| {
+                warn!("Failed to snapshot frame {}. Poisoned lock: {}", self, err);
+                miette!("Poisoned lock when trying to snapshot frame: {}", err)
+            })?
+            .pid
+            .ok_or_else(|| {
+                warn!("Failed to snapshot frame {}. No pid available", self);
+                miette!("No pid available for frame snapshot")
+            })?;
+
+        // Assumption: snapshot_path has already been created by the config setup stage
+        Ok(format!(
+            "{}/snapshot_{}-{}-{}.bin",
+            self.config.snapshots_path, self.job_id, self.frame_id, pid
+        ))
+    }
+
+    /// Save a snapshot of the frame into disk to enable recovering its status in case
+    /// rqd restarts.
+    ///
+    fn snapshot(&self) -> Result<()> {
+        let snapshot_path = self.snapshot_path()?;
+        let file = File::create(&snapshot_path).into_diagnostic()?;
+        let writer = BufWriter::new(file);
+
+        bincode::serialize_into(writer, self)
+            .into_diagnostic()
+            .map_err(|e| miette!("Failed to serialize frame snapshot: {}", e))?;
         Ok(())
+    }
+
+    fn clear_snapshot(&self) -> Result<()> {
+        let snapshot_path = self.snapshot_path()?;
+        fs::remove_file(snapshot_path).into_diagnostic()
+    }
+
+    /// Load a frame from a snapshot file
+    pub fn from_snapshot(path: &str, config: RunnerConfig) -> Result<Self> {
+        let file = File::open(path).into_diagnostic()?;
+        let reader = BufReader::new(file);
+
+        let mut frame: RunningFrame = bincode::deserialize_from(reader)
+            .into_diagnostic()
+            .map_err(|e| miette!("Failed to deserialize frame snapshot: {}", e))?;
+
+        // Replace snapshot config with the new config:
+        frame.config = config;
+
+        Ok(frame)
     }
 
     fn write_header(&self) -> String {
@@ -536,6 +601,50 @@ impl RunningFrameCache {
         self.cache.contains_key(frame_id)
     }
 }
+
+// ===Serialize/Deserialize helpers===
+fn none_value() -> Option<JoinHandle<()>> {
+    None
+}
+
+fn serialize_running_state<S>(
+    state: &Arc<Mutex<RunningState>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    // We only care about serializing the contents, not the mutex itself
+    match state.lock() {
+        Ok(guard) => {
+            // Serialize just the RunningState data
+            RunningState {
+                pid: guard.pid,
+                exit_code: guard.exit_code,
+                launch_thread_handle: None, // We don't want to serialize the thread handle
+            }
+            .serialize(serializer)
+        }
+        Err(_) => {
+            // In case the mutex is poisoned, serialize default values
+            RunningState::default().serialize(serializer)
+        }
+    }
+}
+
+// Custom deserialization for Arc<Mutex<RunningState>>
+fn deserialize_running_state<'de, D>(deserializer: D) -> Result<Arc<Mutex<RunningState>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Deserialize into a RunningState first
+    let state = RunningState::deserialize(deserializer)?;
+
+    // Then wrap it in an Arc<Mutex<_>>
+    Ok(Arc::new(Mutex::new(state)))
+}
+
+// ===End Serialize/Deserialize helpers===
 
 #[cfg(test)]
 mod tests {

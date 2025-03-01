@@ -1,4 +1,6 @@
+use std::fs;
 use std::panic::catch_unwind;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::config::config::Config;
@@ -8,10 +10,10 @@ use crate::system::machine::Machine;
 use crate::system::running_frame::{RunningFrame, RunningFrameCache};
 use opencue_proto::host::HardwareState;
 use opencue_proto::job::nested_job::UidOptional;
-use opencue_proto::rqd::run_frame;
 use opencue_proto::rqd::RunFrame;
+use opencue_proto::rqd::run_frame;
 use opencue_proto::rqd::{
-    rqd_interface_server::RqdInterface, RqdStaticGetRunFrameRequest, RqdStaticGetRunFrameResponse,
+    RqdStaticGetRunFrameRequest, RqdStaticGetRunFrameResponse,
     RqdStaticGetRunningFrameStatusRequest, RqdStaticGetRunningFrameStatusResponse,
     RqdStaticKillRunningFrameRequest, RqdStaticKillRunningFrameResponse,
     RqdStaticLaunchFrameRequest, RqdStaticLaunchFrameResponse, RqdStaticLockAllRequest,
@@ -23,9 +25,9 @@ use opencue_proto::rqd::{
     RqdStaticRestartNowRequest, RqdStaticRestartNowResponse, RqdStaticShutdownIdleRequest,
     RqdStaticShutdownIdleResponse, RqdStaticShutdownNowRequest, RqdStaticShutdownNowResponse,
     RqdStaticUnlockAllRequest, RqdStaticUnlockAllResponse, RqdStaticUnlockRequest,
-    RqdStaticUnlockResponse,
+    RqdStaticUnlockResponse, rqd_interface_server::RqdInterface,
 };
-use tonic::{async_trait, Request, Response};
+use tonic::{Request, Response, async_trait};
 use tracing::error;
 
 pub type MachineImpl = dyn Machine + Sync + Send;
@@ -43,11 +45,23 @@ impl RqdServant {
         running_frame_cache: Arc<RunningFrameCache>,
         machine: Arc<MachineImpl>,
     ) -> Self {
+        if let Err(err) = Self::setup(&config) {
+            panic!("Servant cannot start. Setup failed: {}", err)
+        };
         Self {
             config,
             running_frame_cache,
             machine,
         }
+    }
+
+    fn setup(config: &Config) -> Result<()> {
+        // Ensure snapshot path exists
+        let snapshots_path = Path::new(&config.runner.snapshots_path);
+        if !snapshots_path.exists() {
+            fs::create_dir_all(snapshots_path)?;
+        }
+        Ok(())
     }
 
     fn validate_frame(&self, run_frame: &RunFrame) -> Result<()> {
@@ -82,7 +96,7 @@ impl RqdServant {
         // Fractional cpu cores are not allowed
         if run_frame.num_cores % 100 != 0 {
             Err(tonic::Status::invalid_argument(
-                "Not launching, num_cores must be multiple of 100 (Fractional Cores are not allowed)"
+                "Not launching, num_cores must be multiple of 100 (Fractional Cores are not allowed)",
             ))?
         }
 

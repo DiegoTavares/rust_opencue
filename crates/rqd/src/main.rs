@@ -67,6 +67,8 @@ async fn main() -> miette::Result<()> {
         }
     });
 
+    // TODO: Recover snapshot frames
+
     // Initialize rqd grpc servant
     servant::serve(config, Arc::clone(&running_frame_cache), mm_clone)
         .await

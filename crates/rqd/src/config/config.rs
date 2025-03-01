@@ -83,7 +83,7 @@ impl Default for MachineConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct RunnerConfig {
     // TODO: Add config items to sample file and document their usage
@@ -96,6 +96,7 @@ pub struct RunnerConfig {
     pub run_as_user: bool,
     pub temp_path: String,
     pub shell_path: String,
+    pub snapshots_path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -118,6 +119,7 @@ impl Default for RunnerConfig {
             run_as_user: true,
             temp_path: std::env::temp_dir().to_str().unwrap_or("/tmp").to_string(),
             shell_path: "/bin/bash".to_string(),
+            snapshots_path: "$HOME/.rqd/snapshots".to_string(),
         }
     }
 }
