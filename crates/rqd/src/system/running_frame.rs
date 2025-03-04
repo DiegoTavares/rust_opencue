@@ -245,25 +245,32 @@ impl RunningFrame {
             return;
         }
         let logger = Arc::new(logger_base.unwrap());
-        match self.run_inner(Arc::clone(&logger)) {
-            Ok(exit_code) => self.update_exit_code(exit_code),
+        let exit_code = match self.run_inner(Arc::clone(&logger)) {
+            Ok(exit_code) => {
+                self.update_exit_code(exit_code);
+                Some(exit_code)
+            }
             Err(err) => {
                 let msg = format!("Frame {} failed to be spawned. {}", self.to_string(), err);
                 logger.writeln(&msg);
                 error!(msg);
+                None
             }
-        }
+        };
         if let Err(err) = self.clear_snapshot() {
-            warn!(
-                "Failed to clear snapshot {}: {}",
-                self.snapshot_path().unwrap_or("empty_path".to_string()),
-                err
-            );
+            // Only warn if a job was actually launched
+            if exit_code.is_some() {
+                warn!(
+                    "Failed to clear snapshot {}: {}",
+                    self.snapshot_path().unwrap_or("empty_path".to_string()),
+                    err
+                );
+            }
         };
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub fn run_inner(&self, logger: FrameLogger) -> Result<i32> {
+    fn run_inner(&self, logger: FrameLogger) -> Result<i32> {
         use std::{os::unix::process::ExitStatusExt, sync::mpsc};
 
         use tracing::{info, warn};
@@ -300,7 +307,13 @@ impl RunningFrame {
         }
 
         // Launch frame process
-        let mut child = cmd.spawn().into_diagnostic()?;
+        let mut child = cmd.spawn().into_diagnostic().map_err(|e| {
+            miette!(
+                "Failed to spawn process for command '{}': {}",
+                self.request.command,
+                e
+            )
+        })?;
 
         // Update frame state with frame pid
         let pid = child.id();
@@ -388,6 +401,7 @@ impl RunningFrame {
         raw_stderr_path: &String,
         stop_flag: Receiver<()>,
     ) -> Result<()> {
+        // TODO: Add logic to handle snapshot recover
         let stdout_file = File::open(raw_stdout_path)
             .map_err(|err| miette!("Failed to open raw stdout ({raw_stdout_path}). {err}"))?;
         let mut stdout = BufReader::new(stdout_file).lines().peekable();
@@ -542,7 +556,6 @@ Environment Variables:
 }
 
 /// Keep track of all frames currently running
-/// TODO: Implement recovery strategy to allow restarting rqd
 /// without losing track of what's running
 #[derive(Clone)]
 pub struct RunningFrameCache {
