@@ -119,7 +119,7 @@ impl Default for RunnerConfig {
             run_as_user: false,
             temp_path: std::env::temp_dir().to_str().unwrap_or("/tmp").to_string(),
             shell_path: "/bin/bash".to_string(),
-            snapshots_path: "$HOME/.rqd/snapshots".to_string(),
+            snapshots_path: "/tmp".to_string(),
         }
     }
 }

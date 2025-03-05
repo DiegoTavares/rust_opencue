@@ -4,13 +4,15 @@ use std::{
 };
 
 use config::config::Config;
+use frame::{cache::RunningFrameCache, manager::FrameManager};
 use miette::IntoDiagnostic;
 use report_client::ReportClient;
 use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
-use system::{machine::MachineMonitor, running_frame::RunningFrameCache};
+use system::machine::MachineMonitor;
 use tracing_rolling_file::{RollingConditionBase, RollingFileAppenderBase};
 
 mod config;
+mod frame;
 mod report_client;
 mod servant;
 mod system;
@@ -38,7 +40,7 @@ async fn main() -> miette::Result<()> {
         log_builder.init();
     }
 
-    let running_frame_cache = Arc::new(RunningFrameCache::init());
+    let running_frame_cache = RunningFrameCache::init();
     // Initialize cuebot client
     let report_client = Arc::new(ReportClient::build(&config).await?);
 
@@ -61,6 +63,14 @@ async fn main() -> miette::Result<()> {
         diskinfo,
     )?);
     let mm_clone = Arc::clone(&machine_monitor);
+
+    // Initialize frame manager
+    let frame_manager = Arc::new(FrameManager {
+        config: config.clone(),
+        frame_cache: Arc::clone(&running_frame_cache),
+        machine: mm_clone.clone(),
+    });
+
     tokio::spawn(async move {
         if let Err(e) = machine_monitor.start().await {
             panic!("MachineMonitor loop crashed. {e}")
@@ -70,7 +80,7 @@ async fn main() -> miette::Result<()> {
     // TODO: Recover snapshot frames
 
     // Initialize rqd grpc servant
-    servant::serve(config, Arc::clone(&running_frame_cache), mm_clone)
+    servant::serve(config, mm_clone, frame_manager)
         .await
         .into_diagnostic()
 }

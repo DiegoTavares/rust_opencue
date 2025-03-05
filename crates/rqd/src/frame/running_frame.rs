@@ -16,6 +16,7 @@ use std::{
 use std::{process::Stdio, thread};
 
 use serde::{Deserialize, Serialize};
+use sysinfo::{Pid, System};
 use tracing::{error, warn};
 
 use dashmap::DashMap;
@@ -26,9 +27,8 @@ use opencue_proto::{
 };
 use uuid::Uuid;
 
-use super::logging::FrameLogger;
+use super::logging::{FrameLogger, FrameLoggerBuilder};
 use crate::config::config::RunnerConfig;
-use crate::system::{frame_cmd::FrameCmdBuilder, logging::FrameLoggerBuilder};
 
 /// Wrapper around protobuf message RunningFrameInfo
 #[derive(Serialize, Deserialize)]
@@ -74,23 +74,23 @@ impl RunningState {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct FrameStats {
     /// Maximum resident set size (KB) - maximum amount of physical memory used.
-    max_rss: u64,
+    pub(super) max_rss: u64,
     /// Current resident set size (KB) - amount of physical memory currently in use.
-    rss: u64,
+    pub(super) rss: u64,
     /// Maximum virtual memory size (KB) - maximum amount of virtual memory used.
-    max_vsize: u64,
+    pub(super) max_vsize: u64,
     /// Current virtual memory size (KB) - amount of virtual memory currently in use.
-    vsize: u64,
+    pub(super) vsize: u64,
     /// Last level cache utilization time.
-    llu_time: u64,
+    pub(super) llu_time: u64,
     /// Maximum GPU memory usage (KB).
-    max_used_gpu_memory: u64,
+    pub(super) max_used_gpu_memory: u64,
     /// Current GPU memory usage (KB).
-    used_gpu_memory: u64,
+    pub(super) used_gpu_memory: u64,
     /// Additional data about the running frame's child processes.
-    pub children: Option<ChildrenProcStats>,
+    pub(super) children: Option<ChildrenProcStats>,
     /// Unix timestamp denoting the start time of the frame process.
-    epoch_start_time: u64,
+    pub(super) epoch_start_time: u64,
 }
 
 impl Default for FrameStats {
@@ -274,6 +274,8 @@ impl RunningFrame {
         use std::{os::unix::process::ExitStatusExt, sync::mpsc};
 
         use tracing::{info, warn};
+
+        use crate::frame::frame_cmd::FrameCmdBuilder;
 
         if self.config.run_on_docker {
             return self.run_on_docker();
@@ -495,7 +497,36 @@ impl RunningFrame {
         // Replace snapshot config with the new config:
         frame.config = config;
 
-        Ok(frame)
+        // Check if pid is still active
+        let pid = match frame
+            .mutable_state
+            .lock()
+            .map_err(|err| {
+                miette!(
+                    "Failed to get lock on snapshot for frame {}. {}",
+                    frame,
+                    err
+                )
+            })?
+            .pid
+        {
+            Some(pid) => Self::is_process_running(pid).then(|| pid).ok_or(miette!(
+                "Frame pid {} not found for this snapshot. {}",
+                pid,
+                frame.to_string()
+            )),
+            None => Err(miette!("Invalid snapshot. Pid not present. {}", frame)),
+        };
+        pid.map(|_| frame)
+    }
+
+    fn is_process_running(pid: u32) -> bool {
+        let mut system = System::new_all();
+        system.refresh_processes(
+            sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+            true,
+        );
+        system.process(Pid::from_u32(pid)).is_some()
     }
 
     fn write_header(&self) -> String {
@@ -555,66 +586,6 @@ Environment Variables:
     }
 }
 
-/// Keep track of all frames currently running
-/// without losing track of what's running
-#[derive(Clone)]
-pub struct RunningFrameCache {
-    cache: DashMap<Uuid, Arc<RunningFrame>>,
-}
-
-impl RunningFrameCache {
-    pub fn init() -> Arc<Self> {
-        Arc::new(Self {
-            cache: DashMap::with_capacity(30),
-        })
-    }
-
-    /// Clones the contents of the cache into a vector. This method is potentially expensive,
-    /// it should only be used when a snapshot of the current state is required
-    pub fn into_running_frame_vec(&self) -> Vec<RunningFrameInfo> {
-        self.cache
-            .iter()
-            .map(|running_frame| {
-                let frame_stats = running_frame
-                    .frame_stats
-                    .clone()
-                    .unwrap_or(FrameStats::default());
-                RunningFrameInfo {
-                    resource_id: running_frame.request.resource_id.clone(),
-                    job_id: running_frame.request.job_id.to_string(),
-                    job_name: running_frame.request.job_name.clone(),
-                    frame_id: running_frame.request.frame_id.to_string(),
-                    frame_name: running_frame.request.frame_name.clone(),
-                    layer_id: running_frame.request.layer_id.to_string(),
-                    num_cores: running_frame.request.num_cores as i32,
-                    start_time: frame_stats.epoch_start_time as i64,
-                    max_rss: frame_stats.max_rss as i64,
-                    rss: frame_stats.rss as i64,
-                    max_vsize: frame_stats.max_vsize as i64,
-                    vsize: frame_stats.vsize as i64,
-                    attributes: running_frame.request.attributes.clone(),
-                    llu_time: frame_stats.llu_time as i64,
-                    num_gpus: running_frame.request.num_gpus as i32,
-                    max_used_gpu_memory: frame_stats.max_used_gpu_memory as i64,
-                    used_gpu_memory: frame_stats.used_gpu_memory as i64,
-                    children: frame_stats.children.clone(),
-                }
-            })
-            .collect()
-    }
-
-    pub fn insert_running_frame(
-        &self,
-        running_frame: Arc<RunningFrame>,
-    ) -> Option<Arc<RunningFrame>> {
-        self.cache.insert(running_frame.frame_id, running_frame)
-    }
-
-    pub fn contains(&self, frame_id: &Uuid) -> bool {
-        self.cache.contains_key(frame_id)
-    }
-}
-
 // ===Serialize/Deserialize helpers===
 fn none_value() -> Option<JoinHandle<()>> {
     None
@@ -666,7 +637,9 @@ mod tests {
     use std::sync::Arc;
     use uuid::Uuid;
 
-    use crate::{config::config::RunnerConfig, system::logging::FrameLoggerT};
+    use crate::config::config::RunnerConfig;
+    use crate::frame::logging::FrameLoggerT;
+    use crate::frame::logging::TestLogger;
 
     use super::RunningFrame;
 
@@ -718,8 +691,6 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_run_logs_stdout_stderr() {
-        use crate::system::logging::TestLogger;
-
         let mut env = HashMap::with_capacity(1);
         env.insert("TEST_ENV".to_string(), "test".to_string());
         let running_frame = create_running_frame(
@@ -741,8 +712,6 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_run_failed() {
-        use crate::system::logging::TestLogger;
-
         let mut env = HashMap::with_capacity(1);
         env.insert("TEST_ENV".to_string(), "test".to_string());
         let running_frame = create_running_frame(r#"echo "stdout $TEST_ENV" && exit 1"#, 1, 1, env);
@@ -758,8 +727,6 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_run_multiline_stdout() {
-        use crate::system::logging::TestLogger;
-
         let running_frame = create_running_frame(
             r#"echo "line1" && echo "line2" && echo "line3""#,
             1,
@@ -780,8 +747,6 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_run_env_variables() {
-        use crate::system::logging::TestLogger;
-
         let mut env = HashMap::new();
         env.insert("VAR1".to_string(), "value1".to_string());
         env.insert("VAR2".to_string(), "value2".to_string());
@@ -799,8 +764,6 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_run_command_not_found() {
-        use crate::system::logging::TestLogger;
-
         let running_frame =
             create_running_frame(r#"command_that_does_not_exist"#, 1, 1, HashMap::new());
 
@@ -815,7 +778,6 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_run_sleep_command() {
-        use crate::system::logging::TestLogger;
         use std::time::{Duration, Instant};
 
         let running_frame =
@@ -839,8 +801,6 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_run_interleaved_stdout_stderr() {
-        use crate::system::logging::TestLogger;
-
         let running_frame = create_running_frame(
             r#"echo "stdout1" && echo "stderr1" >&2 && echo "stdout2" && echo "stderr2" >&2"#,
             1,
@@ -864,8 +824,6 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_run_with_special_characters() {
-        use crate::system::logging::TestLogger;
-
         let mut env = HashMap::new();
         env.insert("SPECIAL".to_string(), "!@#$%^&*()".to_string());
 

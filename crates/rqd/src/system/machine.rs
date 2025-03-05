@@ -16,10 +16,11 @@ use tracing::debug;
 
 use crate::{
     config::config::{Config, MachineConfig},
+    frame::cache::RunningFrameCache,
     report_client::{ReportClient, ReportInterface},
 };
 
-use super::{linux::LinuxSystem, running_frame::RunningFrameCache};
+use super::linux::LinuxSystem;
 
 type SystemControllerType = Box<dyn SystemController + Sync + Send>;
 
