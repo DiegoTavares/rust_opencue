@@ -66,7 +66,7 @@ async fn main() -> miette::Result<()> {
 
     // Initialize frame manager
     let frame_manager = Arc::new(FrameManager {
-        config: config.clone(),
+        config: config.runner.clone(),
         frame_cache: Arc::clone(&running_frame_cache),
         machine: mm_clone.clone(),
     });
@@ -78,9 +78,17 @@ async fn main() -> miette::Result<()> {
     });
 
     // TODO: Recover snapshot frames
+    frame_manager.recover_snapshots()?;
 
     // Initialize rqd grpc servant
     servant::serve(config, mm_clone, frame_manager)
         .await
         .into_diagnostic()
 }
+
+// To launch a process in a different process group in Linux, a binary (or executable) needs to have the following capabilities:
+// 1. **CAP_SYS_ADMIN**: This capability allows the process to perform a variety of administrative tasks, including creating and managing process groups.
+// 2. **CAP_SETGID**: This capability allows the process to change the group ID of the process, which is necessary when launching a process in a different group.
+// 3. **CAP_SETUID**: This capability allows the process to change the user ID of the process, which may be needed if the new process requires different user permissions.
+// 4. **CAP_CHOWN**: This capability allows changing the ownership of files, which can be relevant if the new process needs to access specific resources.
+// Having these capabilities enables the binary to effectively manage and launch processes in different groups as required.

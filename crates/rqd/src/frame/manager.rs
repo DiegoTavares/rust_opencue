@@ -1,22 +1,40 @@
-use miette::Result;
+use miette::{Result, miette};
 use opencue_proto::{
     host::HardwareState,
     rqd::{RunFrame, run_frame},
 };
-use std::sync::Arc;
-use tracing::error;
+use std::{fs, sync::Arc};
+use tracing::{error, info, warn};
 
-use crate::{config::config::Config, servant::rqd_servant::MachineImpl};
+use crate::{config::config::RunnerConfig, servant::rqd_servant::MachineImpl};
 
 use super::{cache::RunningFrameCache, running_frame::RunningFrame};
 
 pub struct FrameManager {
-    pub config: Config,
+    pub config: RunnerConfig,
     pub frame_cache: Arc<RunningFrameCache>,
     pub machine: Arc<MachineImpl>,
 }
 
 impl FrameManager {
+    /// Spawns a new frame to be executed on this host.
+    ///
+    /// This function handles the entire process of validating, preparing, and launching a frame:
+    /// - Validates the frame and machine state
+    /// - Reserves CPU resources if the frame is hyperthreaded
+    /// - Reserves GPU resources if requested
+    /// - Creates the user if necessary
+    /// - Initializes and launches the frame in a separate thread
+    ///
+    /// # Arguments
+    ///
+    /// * `run_frame` - The grpc frame configuration containing all information needed to run the
+    ///   job
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if the frame was successfully spawned
+    /// * `Err(FrameManagerError)` if the frame could not be spawned for any reason
     pub async fn spawn(&self, run_frame: RunFrame) -> Result<(), FrameManagerError> {
         // Validate machine state
         self.validate_grpc_frame(&run_frame)?;
@@ -79,26 +97,80 @@ impl FrameManager {
                         run_frame.user_name, uid, run_frame.gid, err
                     ))
                 })?,
-            None => self.config.runner.default_uid,
+            None => self.config.default_uid,
         };
 
         let running_frame = Arc::new(RunningFrame::init(
             run_frame,
             uid,
-            self.config.runner.clone(),
+            self.config.clone(),
             cpu_list,
             gpu_list,
             self.machine.get_host_name().await,
         ));
 
+        self.spawn_running_frame(running_frame, false);
+        Ok(())
+    }
+
+    /// Recovers frames from saved snapshots on disk.
+    ///
+    /// This function:
+    /// - Reads saved frame snapshots from the configured snapshots directory
+    /// - Deserializes each valid snapshot file into a RunningFrame
+    /// - Spawns recovered frames to continue execution
+    /// - Cleans up invalid or corrupted snapshot files
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if snapshot recovery was attempted (even if some snapshots failed)
+    /// * `Err(miette::Error)` if the snapshots directory could not be read
+    pub fn recover_snapshots(&self) -> Result<()> {
+        let snapshots_path = &self.config.snapshots_path;
+        let read_dirs = std::fs::read_dir(snapshots_path).map_err(|err| {
+            let msg = format!("Failed to read snapshot dir. {}", err);
+            warn!(msg);
+            miette!(msg)
+        })?;
+        // Filter paths that are files ending with .bin
+        let snapshot_dir: Vec<String> = read_dirs
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let file_type = entry.file_type().ok()?;
+                if file_type.is_file() && entry.file_name().to_str().unwrap_or("").ends_with(".bin")
+                {
+                    entry.path().to_str().map(String::from)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for path in snapshot_dir {
+            let running_frame =
+                RunningFrame::from_snapshot(&path, self.config.clone()).map(|rf| Arc::new(rf));
+            match running_frame {
+                Ok(running_frame) => self.spawn_running_frame(running_frame, true),
+                Err(err) => {
+                    error!("Snapshot recover failed: {}", err);
+                    if let Err(err) = fs::remove_file(&path) {
+                        warn!("Snapshot {} failed to be cleared. {}", path, err);
+                    };
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn spawn_running_frame(&self, running_frame: Arc<RunningFrame>, recover_mode: bool) {
         self.frame_cache
             .insert_running_frame(Arc::clone(&running_frame));
         let running_frame_ref: Arc<RunningFrame> = Arc::clone(&running_frame);
         // Fire and forget
         let thread_handle = std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(|| running_frame.run());
+            let result = std::panic::catch_unwind(|| running_frame.run(recover_mode));
             if let Err(panic_info) = result {
-                running_frame.update_exit_code(1);
+                running_frame.update_exit_code_and_signal(1, None);
                 error!("Run thread panicked: {:?}", panic_info);
             }
         });
@@ -108,7 +180,6 @@ impl FrameManager {
         // Store the thread handle for bookeeping
         // TODO: Implement logic that checks if the thread is alive during monitoring
         running_frame_ref.update_launch_thread_handle(thread_handle);
-        Ok(())
     }
 
     fn validate_grpc_frame(&self, run_frame: &RunFrame) -> Result<(), FrameManagerError> {
