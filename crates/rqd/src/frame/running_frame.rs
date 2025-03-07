@@ -165,6 +165,8 @@ impl RunningFrame {
             .to_string();
         let env_vars = Self::setup_env_vars(&config, &request, hostname.clone(), log_path.clone());
 
+        // Ensure snapshot path exists
+
         RunningFrame {
             request,
             job_id,
@@ -697,7 +699,6 @@ impl RunningFrame {
                 miette!("No pid available for frame snapshot")
             })?;
 
-        // Assumption: snapshot_path has already been created by the config setup stage
         Ok(format!(
             "{}/snapshot_{}-{}-{}.bin",
             self.config.snapshots_path, self.job_id, self.frame_id, pid
@@ -897,6 +898,7 @@ mod tests {
     use std::sync::Arc;
     use uuid::Uuid;
 
+    use crate::config::config::Config;
     use crate::config::config::RunnerConfig;
     use crate::frame::logging::FrameLoggerT;
     use crate::frame::logging::TestLogger;
@@ -910,7 +912,9 @@ mod tests {
         environment: HashMap<String, String>,
     ) -> RunningFrame {
         let frame_id = Uuid::new_v4().to_string();
-        let mut config = RunnerConfig::default();
+        let general_config = Config::default();
+        general_config.setup().unwrap();
+        let mut config = general_config.runner;
         config.run_as_user = false;
 
         RunningFrame::init(

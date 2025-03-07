@@ -1,9 +1,10 @@
-use miette::{Result, miette};
+use miette::{Diagnostic, Result, miette};
 use opencue_proto::{
     host::HardwareState,
     rqd::{RunFrame, run_frame},
 };
 use std::{fs, sync::Arc};
+use thiserror::Error;
 use tracing::{error, info, warn};
 
 use crate::{config::config::RunnerConfig, servant::rqd_servant::MachineImpl};
@@ -242,13 +243,20 @@ impl FrameManager {
     }
 }
 
+#[derive(Debug, Error, Diagnostic)]
 pub enum FrameManagerError {
+    #[error("Action aborted due to a host invalid state")]
     InvalidHardwareState(String),
+    #[error("Invalid Request")]
     InvalidArgument(String),
+    #[error("Frame is already running")]
     AlreadyExist(String),
+    #[error("Aborted")]
     Aborted(String),
+    #[error("Execution aborted, host is nimby locked")]
     NimbyLocked,
 }
+
 impl From<FrameManagerError> for tonic::Status {
     fn from(value: FrameManagerError) -> Self {
         match value {

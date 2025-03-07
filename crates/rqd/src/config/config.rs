@@ -2,7 +2,7 @@ use crate::config::error::RqdConfigError;
 use bytesize::ByteSize;
 use config::{Config as ConfigBase, Environment, File};
 use serde::{Deserialize, Serialize};
-use std::{env, sync::Arc};
+use std::{env, fs, path::Path, sync::Arc};
 
 static DEFAULT_CONFIG_FILE: &str = "~/.local/share/rqd.yaml";
 
@@ -199,12 +199,16 @@ impl Config {
                 ))
             })?;
 
-        Config::deserialize(config).map_err(|err| {
+        let deserialized_config = Config::deserialize(config).map_err(|err| {
             RqdConfigError::LoadConfigError(format!(
                 "{:?} config could not be deserialized",
                 &config_file
             ))
-        })
+        })?;
+
+        Self::setup(&deserialized_config)?;
+
+        Ok(deserialized_config)
     }
 
     pub fn load_file_and_env<P: AsRef<str>>(path: P) -> Result<Self, RqdConfigError> {
@@ -235,5 +239,20 @@ impl Config {
                     path.as_ref()
                 ))
             })
+    }
+
+    // TODO: Ensure paths exist and permissions are adequate
+    pub fn setup(&self) -> Result<(), RqdConfigError> {
+        // Ensure snapshot path exists
+        let snapshots_path = Path::new(&self.runner.snapshots_path);
+        if !snapshots_path.exists() {
+            fs::create_dir_all(snapshots_path).map_err(|err| {
+                RqdConfigError::InvalidPath(format!(
+                    "Failed to create snapshot dir at {:?}: {err}",
+                    snapshots_path
+                ))
+            })?;
+        }
+        Ok(())
     }
 }

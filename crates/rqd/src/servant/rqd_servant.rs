@@ -38,23 +38,11 @@ impl RqdServant {
         machine: Arc<MachineImpl>,
         frame_manager: Arc<FrameManager>,
     ) -> Self {
-        if let Err(err) = Self::setup(&config) {
-            panic!("Servant cannot start. Setup failed: {}", err)
-        };
         Self {
             config,
             machine,
             frame_manager,
         }
-    }
-
-    fn setup(config: &Config) -> Result<()> {
-        // Ensure snapshot path exists
-        let snapshots_path = Path::new(&config.runner.snapshots_path);
-        if !snapshots_path.exists() {
-            fs::create_dir_all(snapshots_path)?;
-        }
-        Ok(())
     }
 }
 
