@@ -39,7 +39,7 @@ pub struct GrpcConfig {
 impl Default for GrpcConfig {
     fn default() -> GrpcConfig {
         GrpcConfig {
-            rqd_port: 4778,
+            rqd_port: 8444,
             cuebot_url: "localhost:4343".to_string(),
         }
     }
@@ -119,7 +119,10 @@ impl Default for RunnerConfig {
             run_as_user: false,
             temp_path: std::env::temp_dir().to_str().unwrap_or("/tmp").to_string(),
             shell_path: "/bin/bash".to_string(),
-            snapshots_path: "/tmp".to_string(),
+            snapshots_path: format!(
+                "{}/.rqd/snapshots",
+                std::env::var("HOME").unwrap_or("/tmp".to_string())
+            ),
         }
     }
 }

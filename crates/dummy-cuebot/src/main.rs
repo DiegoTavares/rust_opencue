@@ -43,7 +43,7 @@ struct RqdClientCmd {
     #[structopt(
         long,
         short = "p",
-        default_value = "4344",
+        default_value = "8444",
         long_help = "Port to bind to"
     )]
     port: u16,

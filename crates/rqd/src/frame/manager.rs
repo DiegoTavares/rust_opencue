@@ -235,9 +235,9 @@ impl FrameManager {
             ))?
         }
         // Nimby locked
-        if self.machine.nimby_locked().await && !ignore_nimby {}
-        // TODO: Chech if nimby is active and user activity was detected
-
+        if self.machine.nimby_locked().await && !ignore_nimby {
+            Err(FrameManagerError::NimbyLocked)?
+        }
         Ok(())
     }
 }
@@ -247,6 +247,7 @@ pub enum FrameManagerError {
     InvalidArgument(String),
     AlreadyExist(String),
     Aborted(String),
+    NimbyLocked,
 }
 impl From<FrameManagerError> for tonic::Status {
     fn from(value: FrameManagerError) -> Self {
@@ -255,6 +256,7 @@ impl From<FrameManagerError> for tonic::Status {
             FrameManagerError::InvalidArgument(msg) => tonic::Status::invalid_argument(msg),
             FrameManagerError::AlreadyExist(msg) => tonic::Status::invalid_argument(msg),
             FrameManagerError::Aborted(msg) => tonic::Status::aborted(msg),
+            FrameManagerError::NimbyLocked => tonic::Status::aborted("Nimby Locked"),
         }
     }
 }
