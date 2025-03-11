@@ -165,8 +165,6 @@ impl RunningFrame {
             .to_string();
         let env_vars = Self::setup_env_vars(&config, &request, hostname.clone(), log_path.clone());
 
-        // Ensure snapshot path exists
-
         RunningFrame {
             request,
             job_id,
