@@ -41,6 +41,26 @@ impl FrameManager {
         self.validate_grpc_frame(&run_frame)?;
         self.validate_machine_state(run_frame.ignore_nimby).await?;
 
+        // Create user if required. uid and gid ranges have already been verified
+        let uid = match run_frame.uid_optional.as_ref().map(|o| match o {
+            run_frame::UidOptional::Uid(v) => *v as u32,
+        }) {
+            Some(uid) => self
+                .machine
+                .create_user_if_unexisting(&run_frame.user_name, uid, run_frame.gid as u32)
+                .await
+                .map_err(|err| {
+                    FrameManagerError::Aborted(format!(
+                        "Not launching, user {}({}:{}) could not be created. {:?}",
+                        run_frame.user_name, uid, run_frame.gid, err
+                    ))
+                })?,
+            None => self.config.default_uid,
+        };
+
+        // **Attention**: If an error happens between here and spawning a frame, the resources
+        // reserved need to be released.
+        //
         // Cuebot unfortunatelly uses a hardcoded frame environment variable to signal if
         // a frame is hyperthreaded. Rqd should only reserve cores if a frame is hyperthreaded.
         let hyperthreaded = run_frame
@@ -54,7 +74,7 @@ impl FrameManager {
                 let cpu_request = run_frame.num_cores as u32 / 100;
                 Some(
                     self.machine
-                        .reserve_cpus(cpu_request)
+                        .reserve_cpus(cpu_request, run_frame.resource_id())
                         .await
                         .map_err(|err| {
                             FrameManagerError::Aborted(format!(
@@ -71,34 +91,21 @@ impl FrameManager {
         // layer. =0 means None, !=0 means Some
         let gpu_list = match run_frame.num_gpus {
             0 => None,
-            _ => Some(
-                self.machine
-                    .reserve_gpus(run_frame.num_gpus as u32)
-                    .await
-                    .map_err(|err| {
-                        FrameManagerError::Aborted(format!(
-                            "Not launching, insufficient resources {:?}",
-                            err
-                        ))
-                    })?,
-            ),
-        };
-
-        // Create user if required. uid and gid ranges have already been verified
-        let uid = match run_frame.uid_optional.as_ref().map(|o| match o {
-            run_frame::UidOptional::Uid(v) => *v as u32,
-        }) {
-            Some(uid) => self
-                .machine
-                .create_user_if_unexisting(&run_frame.user_name, uid, run_frame.gid as u32)
-                .await
-                .map_err(|err| {
+            _ => {
+                let reserved_res = self.machine.reserve_gpus(run_frame.num_gpus as u32).await;
+                if let Err(_) = reserved_res {
+                    // Release cores reserved on the last step
+                    if let Some(procs) = &cpu_list {
+                        self.machine.release_cpus(procs).await;
+                    }
+                }
+                Some(reserved_res.map_err(|err| {
                     FrameManagerError::Aborted(format!(
-                        "Not launching, user {}({}:{}) could not be created. {:?}",
-                        run_frame.user_name, uid, run_frame.gid, err
+                        "Not launching, insufficient resources {:?}",
+                        err
                     ))
-                })?,
-            None => self.config.default_uid,
+                })?)
+            }
         };
 
         let running_frame = Arc::new(RunningFrame::init(

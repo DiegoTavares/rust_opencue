@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::File,
     io::{BufRead, BufReader},
     net::ToSocketAddrs,
@@ -8,14 +8,16 @@ use std::{
 };
 
 use itertools::Itertools;
-use miette::{miette, IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, miette};
 use opencue_proto::host::HardwareState;
 use sysinfo::{DiskRefreshKind, Disks, System};
 use uuid::Uuid;
 
 use crate::config::config::MachineConfig;
 
-use super::machine::{CpuStat, MachineGpuStats, MachineStat, ReservationError, SystemController};
+use super::machine::{
+    CoreReservation, CpuStat, MachineGpuStats, MachineStat, ReservationError, SystemController,
+};
 
 pub struct LinuxSystem {
     config: MachineConfig,
@@ -454,14 +456,19 @@ impl LinuxSystem {
         }
     }
 
-    fn reserve_core(&mut self, phys_id: u32, core_id: u32) -> Result<(), ReservationError> {
+    fn reserve_core(
+        &mut self,
+        phys_id: u32,
+        core_id: u32,
+        reserver_id: Uuid,
+    ) -> Result<(), ReservationError> {
         if self.cpu_stat.available_cores <= 0 {
             Err(ReservationError::NotEnoughResourcesAvailable)?
         }
         self.cpu_stat
             .reserved_cores_by_physid
             .entry(phys_id)
-            .or_insert_with(HashSet::new)
+            .or_insert_with(|| CoreReservation::new(reserver_id))
             .insert(core_id);
         self.cpu_stat.available_cores -= 1;
         Ok(())
@@ -531,7 +538,7 @@ impl SystemController for LinuxSystem {
             .ok_or(ReservationError::NotFoundError(core_id.clone()))
     }
 
-    fn reserve_cores(&mut self, count: u32) -> Result<Vec<u32>, ReservationError> {
+    fn reserve_cores(&mut self, count: u32, frame_id: Uuid) -> Result<Vec<u32>, ReservationError> {
         if count > self.cpu_stat.available_cores {
             Err(ReservationError::NotEnoughResourcesAvailable)?
         }
@@ -550,7 +557,7 @@ impl SystemController for LinuxSystem {
                         let available_cores: Vec<u32> = core_ids_map
                             .keys()
                             .cloned()
-                            .filter(|core_id| !reserved_core_ids.contains(core_id))
+                            .filter(|core_id| !reserved_core_ids.iter().contains(core_id))
                             .collect();
                         // Filter out sockets that are completelly reserved
                         if available_cores.len() > 0 {
@@ -559,7 +566,7 @@ impl SystemController for LinuxSystem {
                             None
                         }
                     }
-                    // If the phys_id doesn't on the reserved_cores map, consider the sockets available
+                    // If the phys_id doesn't exit on the reserved_cores map, consider the sockets available
                     None => Some((phys_id, core_ids_map.keys().copied().collect())),
                 },
             )
@@ -571,7 +578,7 @@ impl SystemController for LinuxSystem {
                 if selected_cores.len() >= count as usize {
                     break;
                 }
-                self.reserve_core(phys_id, core_id)?;
+                self.reserve_core(phys_id, core_id, frame_id)?;
                 selected_cores.push(core_id);
             }
         }
@@ -857,12 +864,13 @@ mod tests {
         // ... existing imports ...
 
         use std::{
-            collections::{HashMap, HashSet},
+            collections::HashMap,
             sync::{Arc, Mutex},
         };
 
         use itertools::Itertools;
         use opencue_proto::host::HardwareState;
+        use uuid::Uuid;
 
         use crate::{
             config::config::MachineConfig,
@@ -877,7 +885,7 @@ mod tests {
             let mut system = setup_test_system(4, 2); // 4 cores total, 2 physical CPUs
 
             // Reserve 2 cores
-            let result = system.reserve_cores(2);
+            let result = system.reserve_cores(2, Uuid::new_v4());
 
             assert!(result.is_ok());
             let reserved = result.unwrap();
@@ -890,7 +898,7 @@ mod tests {
             let mut system = setup_test_system(4, 2);
 
             // Try to reserve more cores than available
-            let result = system.reserve_cores(5);
+            let result = system.reserve_cores(5, Uuid::new_v4());
             assert!(matches!(
                 result,
                 Err(ReservationError::NotEnoughResourcesAvailable)
@@ -903,7 +911,7 @@ mod tests {
             let mut system = setup_test_system(4, 2);
 
             // Reserve all cores
-            let result = system.reserve_cores(4);
+            let result = system.reserve_cores(4, Uuid::new_v4());
             assert!(result.is_ok());
             let reserved = result.unwrap();
             assert_eq!(reserved.len(), 4);
@@ -915,7 +923,7 @@ mod tests {
             let mut system = setup_test_system(12, 3);
 
             // Reserve 2 cores
-            let result = system.reserve_cores(7);
+            let result = system.reserve_cores(7, Uuid::new_v4());
             assert!(result.is_ok());
 
             // Check that cores are distributed across physical CPUs when possible
@@ -923,7 +931,7 @@ mod tests {
                 .cpu_stat
                 .reserved_cores_by_physid
                 .iter()
-                .map(|(_, proc_ids)| proc_ids.len())
+                .map(|(_, proc_ids)| proc_ids.iter().len())
                 .sorted()
                 .collect();
             assert_eq!(
@@ -938,17 +946,17 @@ mod tests {
             let mut system = setup_test_system(4, 2);
 
             // First reservation
-            let result1 = system.reserve_cores(2);
+            let result1 = system.reserve_cores(2, Uuid::new_v4());
             assert!(result1.is_ok());
             assert_eq!(system.cpu_stat.available_cores, 2);
 
             // Second reservation
-            let result2 = system.reserve_cores(1);
+            let result2 = system.reserve_cores(1, Uuid::new_v4());
             assert!(result2.is_ok());
             assert_eq!(system.cpu_stat.available_cores, 1);
 
             // Third reservation - should fail
-            let result3 = system.reserve_cores(2);
+            let result3 = system.reserve_cores(2, Uuid::new_v4());
             assert!(matches!(
                 result3,
                 Err(ReservationError::NotEnoughResourcesAvailable)

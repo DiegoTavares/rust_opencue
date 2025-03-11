@@ -745,6 +745,12 @@ impl RunningFrame {
     /// updates it with the provided configuration, and verifies that the process
     /// is still running before returning the frame. This is primarily used for
     /// recovering frames after RQD restarts.
+    ///
+    /// # Known issues:
+    /// This function relies on pid uniqueness, which is not ensured at the OS level.
+    /// TODO: Consider discarding old snapshots, or add additional checks to ensures
+    /// the snapshot is binding to the correct process
+    ///
     pub fn from_snapshot(path: &str, config: RunnerConfig) -> Result<Self> {
         let file =
             File::open(path).map_err(|err| miette!("Failed to open snapshot file. {}", err))?;
@@ -757,8 +763,7 @@ impl RunningFrame {
         // Replace snapshot config with the new config:
         frame.config = config;
 
-        // Check if pid is still active
-        let pid = match frame
+        let pid = frame
             .mutable_state
             .lock()
             .map_err(|err| {
@@ -768,16 +773,17 @@ impl RunningFrame {
                     err
                 )
             })?
-            .pid
-        {
+            .pid;
+        // Check if pid is still active
+        match pid {
             Some(pid) => Self::is_process_running(pid).then(|| pid).ok_or(miette!(
                 "Frame pid {} not found for this snapshot. {}",
                 pid,
                 frame.to_string()
             )),
             None => Err(miette!("Invalid snapshot. Pid not present. {}", frame)),
-        };
-        pid.map(|_| frame)
+        }
+        .map(|_| frame)
     }
 
     fn is_process_running(pid: u32) -> bool {
