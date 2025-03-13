@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{BufRead, BufReader},
     net::ToSocketAddrs,
@@ -473,6 +473,44 @@ impl LinuxSystem {
         self.cpu_stat.available_cores -= 1;
         Ok(())
     }
+
+    /// Gets the the list of all cores available to be reserved, organized by their socker id (phys_id)
+    ///
+    /// # Returns
+    ///  - Vec(phys_id, Vec<core_id>)
+    fn calculate_available_cores(&self) -> Result<Vec<(&u32, Vec<u32>)>, ReservationError> {
+        let reserved_cores = &self.cpu_stat.reserved_cores_by_physid;
+        let all_cores_map = &self.procid_by_physid_and_core_id;
+
+        // Iterate over all phys_id=>core_id's and filter out cores that have been reserved
+        let available_cores = all_cores_map
+            .into_iter()
+            .filter_map(
+                |(phys_id, core_ids_map)| match reserved_cores.get(&phys_id) {
+                    Some(reserved_core_ids) => {
+                        // Filter out cores that are present in any of the sockets on the
+                        // reserved_cores map
+                        let available_cores: Vec<u32> = core_ids_map
+                            .keys()
+                            .cloned()
+                            .filter(|core_id| !reserved_core_ids.iter().contains(core_id))
+                            .collect();
+                        // Filter out sockets that are completelly reserved
+                        if available_cores.len() > 0 {
+                            Some((phys_id, available_cores))
+                        } else {
+                            None
+                        }
+                    }
+                    // If the phys_id doesn't exit on the reserved_cores map, consider the sockets available
+                    None => Some((phys_id, core_ids_map.keys().copied().collect())),
+                },
+            )
+            // Sort sockets with more available cores first
+            .sorted_by(|a, b| Ord::cmp(&b.1.len(), &a.1.len()));
+
+        Ok(available_cores.collect())
+    }
 }
 
 impl SystemController for LinuxSystem {
@@ -542,45 +580,21 @@ impl SystemController for LinuxSystem {
         if count > self.cpu_stat.available_cores {
             Err(ReservationError::NotEnoughResourcesAvailable)?
         }
+
         let mut selected_cores = Vec::with_capacity(count as usize);
-        let reserved_cores = &self.cpu_stat.reserved_cores_by_physid;
-        let all_cores_map = self.procid_by_physid_and_core_id.clone();
+        let available_cores = self.calculate_available_cores()?;
 
-        // Iterate over all phys_id=>core_id's and filter out cores that have been reserved
-        let available_cores = all_cores_map
+        let cores_to_reserve: Vec<(u32, u32)> = available_cores
             .into_iter()
-            .filter_map(
-                |(phys_id, core_ids_map)| match reserved_cores.get(&phys_id) {
-                    Some(reserved_core_ids) => {
-                        // Filter out cores that are present in any of the sockets on the
-                        // reserved_cores map
-                        let available_cores: Vec<u32> = core_ids_map
-                            .keys()
-                            .cloned()
-                            .filter(|core_id| !reserved_core_ids.iter().contains(core_id))
-                            .collect();
-                        // Filter out sockets that are completelly reserved
-                        if available_cores.len() > 0 {
-                            Some((phys_id, available_cores))
-                        } else {
-                            None
-                        }
-                    }
-                    // If the phys_id doesn't exit on the reserved_cores map, consider the sockets available
-                    None => Some((phys_id, core_ids_map.keys().copied().collect())),
-                },
-            )
-            // Sort sockets with more available cores first
-            .sorted_by(|a, b| Ord::cmp(&b.1.len(), &a.1.len()));
+            .flat_map(|(phys_id, core_ids)| {
+                core_ids.into_iter().map(move |core_id| (*phys_id, core_id))
+            })
+            .take(count as usize)
+            .collect();
 
-        for (phys_id, core_ids) in available_cores {
-            for core_id in core_ids {
-                if selected_cores.len() >= count as usize {
-                    break;
-                }
-                self.reserve_core(phys_id, core_id, frame_id)?;
-                selected_cores.push(core_id);
-            }
+        for (phys_id, core_id) in cores_to_reserve {
+            self.reserve_core(phys_id, core_id, frame_id)?;
+            selected_cores.push(core_id);
         }
 
         // Not having all cores reserved at this point is an unconsistent state, as it has been
@@ -596,6 +610,33 @@ impl SystemController for LinuxSystem {
         }
 
         Ok(selected_cores)
+    }
+
+    fn reserve_cores_by_id(
+        &mut self,
+        cpu_list: &Vec<u32>,
+        resource_id: Uuid,
+    ) -> Result<Vec<u32>, ReservationError> {
+        let available_cores = self.calculate_available_cores()?;
+        let reserved_cores: HashSet<&u32> = cpu_list.iter().collect();
+        let mut result = Vec::new();
+
+        let phyid_coreid_list: Vec<(u32, u32)> = available_cores
+            .into_iter()
+            .flat_map(|(phys_id, core_ids)| {
+                let cores: HashSet<&u32> = core_ids.iter().collect();
+                reserved_cores
+                    .intersection(&cores)
+                    .map(|core_id| (phys_id.clone(), **core_id))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        for (phys_id, core_id) in phyid_coreid_list {
+            self.reserve_core(phys_id, core_id, resource_id)?;
+            result.push(core_id);
+        }
+        Ok(result)
     }
 
     fn create_user_if_unexisting(&self, username: &str, uid: u32, gid: u32) -> Result<u32> {

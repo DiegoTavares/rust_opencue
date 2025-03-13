@@ -9,6 +9,7 @@ use miette::IntoDiagnostic;
 use report_client::ReportClient;
 use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
 use system::machine::MachineMonitor;
+use tracing::warn;
 use tracing_rolling_file::{RollingConditionBase, RollingFileAppenderBase};
 
 mod config;
@@ -78,7 +79,9 @@ async fn main() -> miette::Result<()> {
     });
 
     // TODO: Recover snapshot frames
-    frame_manager.recover_snapshots()?;
+    if let Err(err) = frame_manager.recover_snapshots().await {
+        warn!("Failed to recover frames from snapshot: {}", err);
+    };
 
     // Initialize rqd grpc servant
     servant::serve(config, mm_clone, frame_manager)

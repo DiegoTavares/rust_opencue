@@ -178,7 +178,10 @@ pub trait Machine {
     ///
     /// List of procs (Argument called cpu-list in the unix taskset cmd) reserved
     /// by this request
-    async fn reserve_cpus(&self, num_cores: u32, resource_id: Uuid) -> Result<Vec<u32>>;
+    async fn reserve_cores(&self, num_cores: u32, resource_id: Uuid) -> Result<Vec<u32>>;
+
+    async fn reserve_cores_by_id(&self, cpu_list: &Vec<u32>, resource_id: Uuid)
+    -> Result<Vec<u32>>;
 
     async fn release_cpus(&self, procs: &Vec<u32>);
 
@@ -217,10 +220,21 @@ impl Machine for MachineMonitor {
             .unwrap_or(false)
     }
 
-    async fn reserve_cpus(&self, num_cores: u32, frame_id: Uuid) -> Result<Vec<u32>> {
+    async fn reserve_cores(&self, num_cores: u32, resource_id: Uuid) -> Result<Vec<u32>> {
         let mut stats_collector = self.system_controller.lock().await;
         stats_collector
-            .reserve_cores(num_cores, frame_id)
+            .reserve_cores(num_cores, resource_id)
+            .into_diagnostic()
+    }
+
+    async fn reserve_cores_by_id(
+        &self,
+        cpu_list: &Vec<u32>,
+        resource_id: Uuid,
+    ) -> Result<Vec<u32>> {
+        let mut stats_collector = self.system_controller.lock().await;
+        stats_collector
+            .reserve_cores_by_id(cpu_list, resource_id)
             .into_diagnostic()
     }
 
@@ -327,6 +341,17 @@ pub trait SystemController {
     ///
     /// * Vector of core ids
     fn reserve_cores(&mut self, count: u32, frame_id: Uuid) -> Result<Vec<u32>, ReservationError>;
+
+    /// Reserver specific cores by id.
+    ///
+    /// # Returns:
+    ///
+    /// * Vector of core ids
+    fn reserve_cores_by_id(
+        &mut self,
+        cpu_list: &Vec<u32>,
+        resource_id: Uuid,
+    ) -> Result<Vec<u32>, ReservationError>;
 
     /// Release a core
     fn release_core(&mut self, core_id: &u32) -> Result<(), ReservationError>;

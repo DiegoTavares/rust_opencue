@@ -5,7 +5,8 @@ use opencue_proto::{
 };
 use std::{fs, sync::Arc};
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
+use uuid::Uuid;
 
 use crate::{config::config::RunnerConfig, servant::rqd_servant::MachineImpl};
 
@@ -74,7 +75,7 @@ impl FrameManager {
                 let cpu_request = run_frame.num_cores as u32 / 100;
                 Some(
                     self.machine
-                        .reserve_cpus(cpu_request, run_frame.resource_id())
+                        .reserve_cores(cpu_request, run_frame.resource_id())
                         .await
                         .map_err(|err| {
                             FrameManagerError::Aborted(format!(
@@ -133,7 +134,7 @@ impl FrameManager {
     ///
     /// * `Ok(())` if snapshot recovery was attempted (even if some snapshots failed)
     /// * `Err(miette::Error)` if the snapshots directory could not be read
-    pub fn recover_snapshots(&self) -> Result<()> {
+    pub async fn recover_snapshots(&self) -> Result<()> {
         let snapshots_path = &self.config.snapshots_path;
         let read_dirs = std::fs::read_dir(snapshots_path).map_err(|err| {
             let msg = format!("Failed to read snapshot dir. {}", err);
@@ -153,11 +154,24 @@ impl FrameManager {
                 }
             })
             .collect();
+        let mut errors = Vec::new();
         for path in snapshot_dir {
             let running_frame =
                 RunningFrame::from_snapshot(&path, self.config.clone()).map(|rf| Arc::new(rf));
             match running_frame {
-                Ok(running_frame) => self.spawn_running_frame(running_frame, true),
+                Ok(running_frame) => {
+                    // Update reservations:
+                    if let Some(cpu_list) = &running_frame.cpu_list {
+                        if let Err(err) = self
+                            .machine
+                            .reserve_cores_by_id(cpu_list, running_frame.request.resource_id())
+                            .await
+                        {
+                            errors.push(err.to_string());
+                        }
+                    }
+                    self.spawn_running_frame(running_frame, true)
+                }
                 Err(err) => {
                     error!("Snapshot recover failed: {}", err);
                     if let Err(err) = fs::remove_file(&path) {
@@ -167,7 +181,11 @@ impl FrameManager {
             }
         }
 
-        Ok(())
+        if !errors.is_empty() {
+            Err(miette!("{}", errors.join("\n")))
+        } else {
+            Ok(())
+        }
     }
 
     fn spawn_running_frame(&self, running_frame: Arc<RunningFrame>, recover_mode: bool) {
