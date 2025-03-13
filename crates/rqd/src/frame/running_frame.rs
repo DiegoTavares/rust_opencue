@@ -39,18 +39,18 @@ pub struct RunningFrame {
     pub layer_id: Uuid,
     pub frame_stats: Option<FrameStats>,
     pub log_path: String,
-    pub uid: u32,
-    pub config: RunnerConfig,
+    uid: u32,
+    config: RunnerConfig,
     pub cpu_list: Option<Vec<u32>>,
     pub gpu_list: Option<Vec<u32>>,
-    pub env_vars: HashMap<String, String>,
+    env_vars: HashMap<String, String>,
     pub hostname: String,
-    pub raw_stdout_path: String,
-    pub raw_stderr_path: String,
+    raw_stdout_path: String,
+    raw_stderr_path: String,
     pub exit_file_path: String,
     #[serde(serialize_with = "serialize_running_state")]
     #[serde(deserialize_with = "deserialize_running_state")]
-    pub mutable_state: Arc<Mutex<RunningState>>,
+    mutable_state: Arc<Mutex<RunningState>>,
 }
 
 #[derive(Serialize, Deserialize)]
