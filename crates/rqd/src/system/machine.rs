@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    ops::DerefMut,
     sync::{Arc, Mutex as SyncMutex},
     time::Instant,
 };
@@ -8,12 +9,20 @@ use async_trait::async_trait;
 use miette::{Diagnostic, IntoDiagnostic, Result};
 use opencue_proto::{
     host::HardwareState,
-    report::{CoreDetail, RenderHost},
+    report::{ChildrenProcStats, CoreDetail, RenderHost},
 };
 use sysinfo::{Disks, System};
 use thiserror::Error;
-use tokio::{sync::Mutex, time};
-use tracing::{debug, error, warn};
+use tokio::{
+    select,
+    sync::{
+        Mutex,
+        oneshot::{self, Sender},
+    },
+    time,
+};
+use tokio_stream::StreamExt;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -21,6 +30,7 @@ use crate::{
     frame::cache::RunningFrameCache,
     report_client::{ReportClient, ReportInterface},
 };
+use serde::{Deserialize, Serialize};
 
 use super::linux::LinuxSystem;
 
@@ -51,6 +61,7 @@ pub struct MachineMonitor {
     pub running_frames_cache: Arc<RunningFrameCache>,
     core_state: Arc<Mutex<Option<CoreDetail>>>,
     host_state: Arc<Mutex<Option<RenderHost>>>,
+    interrupt: Mutex<Option<Sender<()>>>,
 }
 
 impl MachineMonitor {
@@ -73,6 +84,7 @@ impl MachineMonitor {
             running_frames_cache,
             core_state: Arc::new(Mutex::new(None)),
             host_state: Arc::new(Mutex::new(None)),
+            interrupt: Mutex::new(None),
         })
     }
 
@@ -108,25 +120,78 @@ impl MachineMonitor {
         let mut interval = time::interval(time::Duration::from_secs(
             self.maching_config.monitor_interval_seconds,
         ));
-        for _i in 0..5 {
-            interval.tick().await;
-            let stats_collector_lock = self.system_controller.lock().await;
-            let host_state = Self::inspect_host_state(&self.maching_config, &stats_collector_lock)?;
-            drop(stats_collector_lock);
 
-            let core_state_guard = self.core_state.lock().await;
-            let core_state = core_state_guard
-                .as_ref()
-                .expect("A state must be set at this point");
+        let (sender, mut receiver) = oneshot::channel::<()>();
+        let mut interrupt_lock = self.interrupt.lock().await;
+        interrupt_lock.replace(sender);
+        drop(interrupt_lock);
 
-            debug!("Sending host report: {:?}", host_state);
-            report_client
-                .send_host_report(
-                    host_state,
-                    Arc::clone(&self.running_frames_cache).into_running_frame_vec(),
-                    core_state.clone(),
-                )
-                .await?;
+        loop {
+            select! {
+                message = &mut receiver => {
+                    match message {
+                        Ok(_) => {
+                            info!("Loop interrupted");
+                            break;
+                        },
+                        Err(_) => info!("Sender dropped"),
+                    }
+                }
+                _ = interval.tick() => {
+                    self.collect_host_report().await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn interrupt(&self) {
+        let mut lock = self.interrupt.lock().await;
+        match lock.take() {
+            Some(sender) => {
+                if let Err(_) = sender.send(()) {
+                    warn!("Failed to request a monitor interruption")
+                }
+            }
+            None => warn!("Interrupt channel has already been used"),
+        }
+    }
+
+    async fn collect_host_report(&self) -> Result<()> {
+        let report_client = self.report_client.clone();
+        let stats_collector_lock = self.system_controller.lock().await;
+        let host_state = Self::inspect_host_state(&self.maching_config, &stats_collector_lock)?;
+        drop(stats_collector_lock);
+
+        let core_state_guard = self.core_state.lock().await;
+        let core_state = core_state_guard
+            .as_ref()
+            .expect("A state must be set at this point");
+
+        self.collect_running_frames_stats().await?;
+
+        debug!("Sending host report: {:?}", host_state);
+        report_client
+            .send_host_report(
+                host_state,
+                Arc::clone(&self.running_frames_cache).into_running_frame_vec(),
+                core_state.clone(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn collect_running_frames_stats(&self) -> Result<()> {
+        let system_monitor = self.system_controller.lock().await;
+        let mut stream = tokio_stream::iter(self.running_frames_cache.iter_mut());
+        while let Some(mut running_frame) = stream.next().await {
+            if let Some(pid) = running_frame.pid() {
+                let proc_stats = system_monitor.collect_proc_stats(pid)?;
+                Arc::get_mut(running_frame.deref_mut())
+                    .unwrap()
+                    .frame_stats
+                    .replace(proc_stats);
+            }
         }
         Ok(())
     }
@@ -316,6 +381,48 @@ pub struct MachineGpuStats {
     /// Used memory by unit of each GPU, where the key in the HashMap is the unit ID, and the value is the used memory
     pub used_memory_by_unit: HashMap<u32, u64>,
 }
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ProcessStats {
+    /// Maximum resident set size (KB) - maximum amount of physical memory used.
+    pub max_rss: u64,
+    /// Current resident set size (KB) - amount of physical memory currently in use.
+    pub rss: u64,
+    /// Maximum virtual memory size (KB) - maximum amount of virtual memory used.
+    pub max_vsize: u64,
+    /// Current virtual memory size (KB) - amount of virtual memory currently in use.
+    pub vsize: u64,
+    /// Last level cache utilization time.
+    pub llu_time: u64,
+    /// Maximum GPU memory usage (KB).
+    pub max_used_gpu_memory: u64,
+    /// Current GPU memory usage (KB).
+    pub used_gpu_memory: u64,
+    /// Additional data about the running frame's child processes.
+    pub children: Option<ChildrenProcStats>,
+    /// Unix timestamp denoting the start time of the frame process.
+    pub epoch_start_time: u64,
+}
+
+impl Default for ProcessStats {
+    fn default() -> Self {
+        ProcessStats {
+            max_rss: 0,
+            rss: 0,
+            max_vsize: 0,
+            vsize: 0,
+            llu_time: 0,
+            max_used_gpu_memory: 0,
+            used_gpu_memory: 0,
+            children: None,
+            epoch_start_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+                .as_secs(),
+        }
+    }
+}
+
 pub trait SystemController {
     /// Collects information about the status of this machine
     fn collect_stats(&self) -> Result<MachineStat>;
@@ -358,6 +465,9 @@ pub trait SystemController {
 
     /// Creates an user if it doesn't already exist
     fn create_user_if_unexisting(&self, username: &str, uid: u32, gid: u32) -> Result<u32>;
+
+    /// Collects stats of a process
+    fn collect_proc_stats(&self, pid: u32) -> Result<ProcessStats>;
 }
 
 #[derive(Debug, Clone, Diagnostic, Error)]

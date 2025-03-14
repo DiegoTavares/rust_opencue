@@ -18,7 +18,7 @@ use std::{process::Stdio, thread};
 
 use tracing::{error, info, warn};
 
-use crate::frame::frame_cmd::FrameCmdBuilder;
+use crate::{frame::frame_cmd::FrameCmdBuilder, system::machine::ProcessStats};
 
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, System};
@@ -37,7 +37,7 @@ pub struct RunningFrame {
     pub job_id: Uuid,
     pub frame_id: Uuid,
     pub layer_id: Uuid,
-    pub frame_stats: Option<FrameStats>,
+    pub frame_stats: Option<ProcessStats>,
     pub log_path: String,
     uid: u32,
     config: RunnerConfig,
@@ -70,47 +70,6 @@ impl RunningState {
             launch_thread_handle: None,
             exit_code: None,
             exit_signal: None,
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct FrameStats {
-    /// Maximum resident set size (KB) - maximum amount of physical memory used.
-    pub(super) max_rss: u64,
-    /// Current resident set size (KB) - amount of physical memory currently in use.
-    pub(super) rss: u64,
-    /// Maximum virtual memory size (KB) - maximum amount of virtual memory used.
-    pub(super) max_vsize: u64,
-    /// Current virtual memory size (KB) - amount of virtual memory currently in use.
-    pub(super) vsize: u64,
-    /// Last level cache utilization time.
-    pub(super) llu_time: u64,
-    /// Maximum GPU memory usage (KB).
-    pub(super) max_used_gpu_memory: u64,
-    /// Current GPU memory usage (KB).
-    pub(super) used_gpu_memory: u64,
-    /// Additional data about the running frame's child processes.
-    pub(super) children: Option<ChildrenProcStats>,
-    /// Unix timestamp denoting the start time of the frame process.
-    pub(super) epoch_start_time: u64,
-}
-
-impl Default for FrameStats {
-    fn default() -> Self {
-        FrameStats {
-            max_rss: 0,
-            rss: 0,
-            max_vsize: 0,
-            vsize: 0,
-            llu_time: 0,
-            max_used_gpu_memory: 0,
-            used_gpu_memory: 0,
-            children: None,
-            epoch_start_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-                .as_secs(),
         }
     }
 }

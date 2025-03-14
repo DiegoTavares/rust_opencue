@@ -4,7 +4,9 @@ use dashmap::DashMap;
 use opencue_proto::report::RunningFrameInfo;
 use uuid::Uuid;
 
-use super::running_frame::{FrameStats, RunningFrame};
+use crate::system::machine::ProcessStats;
+
+use super::running_frame::RunningFrame;
 
 /// Keep track of all frames currently running
 /// without losing track of what's running
@@ -29,7 +31,7 @@ impl RunningFrameCache {
                 let frame_stats = running_frame
                     .frame_stats
                     .clone()
-                    .unwrap_or(FrameStats::default());
+                    .unwrap_or(ProcessStats::default());
                 RunningFrameInfo {
                     resource_id: running_frame.request.resource_id.clone(),
                     job_id: running_frame.request.job_id.to_string(),
@@ -63,5 +65,9 @@ impl RunningFrameCache {
 
     pub fn contains(&self, frame_id: &Uuid) -> bool {
         self.cache.contains_key(frame_id)
+    }
+
+    pub fn iter_mut(&self) -> dashmap::iter::IterMut<'_, Uuid, Arc<RunningFrame>> {
+        self.cache.iter_mut()
     }
 }

@@ -64,6 +64,7 @@ async fn main() -> miette::Result<()> {
         diskinfo,
     )?);
     let mm_clone = Arc::clone(&machine_monitor);
+    let mm_clone2 = Arc::clone(&machine_monitor);
 
     // Initialize frame manager
     let frame_manager = Arc::new(FrameManager {
@@ -84,9 +85,15 @@ async fn main() -> miette::Result<()> {
     };
 
     // Initialize rqd grpc servant
-    servant::serve(config, mm_clone, frame_manager)
+    let out = servant::serve(config, mm_clone, frame_manager)
         .await
-        .into_diagnostic()
+        .into_diagnostic();
+
+    if out.is_err() {
+        mm_clone2.interrupt().await;
+    }
+
+    out
 }
 
 // To launch a process in a different process group in Linux, a binary (or executable) needs to have the following capabilities:

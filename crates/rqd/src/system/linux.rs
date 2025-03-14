@@ -16,7 +16,8 @@ use uuid::Uuid;
 use crate::config::config::MachineConfig;
 
 use super::machine::{
-    CoreReservation, CpuStat, MachineGpuStats, MachineStat, ReservationError, SystemController,
+    CoreReservation, CpuStat, MachineGpuStats, MachineStat, ProcessStats, ReservationError,
+    SystemController,
 };
 
 pub struct LinuxSystem {
@@ -670,6 +671,11 @@ impl SystemController for LinuxSystem {
             Some(user) => Ok(user.uid()),
             None => Err(miette!("Failed to verify user {} was created", username)),
         }
+    }
+
+    fn collect_proc_stats(&self, pid: u32) -> Result<ProcessStats> {
+        // Next
+        todo!()
     }
 }
 
