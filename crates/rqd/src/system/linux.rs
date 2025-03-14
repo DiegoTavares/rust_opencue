@@ -4,13 +4,13 @@ use std::{
     io::{BufRead, BufReader},
     net::ToSocketAddrs,
     process::Command,
-    sync::{Arc, Mutex},
 };
 
 use itertools::Itertools;
 use miette::{IntoDiagnostic, Result, miette};
 use opencue_proto::host::HardwareState;
-use sysinfo::{DiskRefreshKind, Disks, System};
+use sysinfo::{DiskRefreshKind, Disks, MemoryRefreshKind, RefreshKind};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::config::config::MachineConfig;
@@ -22,8 +22,6 @@ use super::machine::{
 
 pub struct LinuxSystem {
     config: MachineConfig,
-    sysinfo: Arc<Mutex<System>>,
-    diskinfo: Arc<Mutex<Disks>>,
     /// Map of procids indexed by physid and coreid
     procid_by_physid_and_core_id: HashMap<u32, HashMap<u32, u32>>,
     /// The inverse map of procid_by_physid_and_core_id
@@ -76,12 +74,8 @@ impl LinuxSystem {
     /// Initialize the linux stats collector which reads Cpu and Memory information from
     /// the Os.
     ///
-    /// sysinfo and diskinfo need to have been initialized.
-    pub fn init(
-        config: &MachineConfig,
-        sysinfo: Arc<Mutex<System>>,
-        diskinfo: Arc<Mutex<Disks>>,
-    ) -> Result<Self> {
+    /// sysinfo needs to have been initialized.
+    pub fn init(config: &MachineConfig) -> Result<Self> {
         let (processor_info, procid_by_physid_and_core_id, physid_and_coreid_by_procid) =
             Self::read_cpuinfo(&config.cpuinfo_path)?;
 
@@ -93,12 +87,13 @@ impl LinuxSystem {
                 Self::read_distro(&config.distro_release_path).unwrap_or("linux".to_string())
             });
 
-        let sysinfo_guard = sysinfo
-            .lock()
-            .map_err(|err| miette!("Failed to acquire sysinfo lock {}", err))?;
-        let total_memory = sysinfo_guard.total_memory();
-        let total_swap = sysinfo_guard.total_swap();
-        drop(sysinfo_guard);
+        // Initialize sysinfo collectors
+        let sysinfo = sysinfo::System::new_with_specifics(
+            RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+        );
+        let total_memory = sysinfo.total_memory();
+        let total_swap = sysinfo.total_swap();
+
         let available_core_count = procid_by_physid_and_core_id
             .values()
             .map(|sockets| sockets.iter().count())
@@ -107,8 +102,6 @@ impl LinuxSystem {
 
         Ok(Self {
             config: config.clone(),
-            sysinfo,
-            diskinfo,
             procid_by_physid_and_core_id,
             physid_and_coreid_by_procid,
             static_info: MachineStaticInfo {
@@ -267,8 +260,8 @@ impl LinuxSystem {
     ///
     /// A `Result` containing a `String` representing the hostname or IP address of the machine.
     fn get_hostname(use_ip_as_hostname: bool) -> Result<String> {
-        let hostname =
-            System::host_name().ok_or_else(|| miette::miette!("Failed to get hostname"))?;
+        let hostname = sysinfo::System::host_name()
+            .ok_or_else(|| miette::miette!("Failed to get hostname"))?;
         if use_ip_as_hostname {
             let mut addrs_iter = format!("{}:443", hostname)
                 .to_socket_addrs()
@@ -382,15 +375,13 @@ impl LinuxSystem {
         let config = &self.config;
         let load = Self::read_load_avg(&config.proc_loadavg_path)?;
         let (total_space, available_space) = self.read_temp_storage()?;
-        let mut sysinfo_guard = self
-            .sysinfo
-            .lock()
-            .map_err(|err| miette!("Failed to acquire sysinfo lock {}", err))?;
-        sysinfo_guard.refresh_memory();
+        let sysinfo = sysinfo::System::new_with_specifics(
+            RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+        );
 
         Ok(MachineDynamicInfo {
-            free_memory: sysinfo_guard.free_memory(),
-            free_swap: sysinfo_guard.free_swap(),
+            free_memory: sysinfo.free_memory(),
+            free_swap: sysinfo.free_swap(),
             total_temp_storage: total_space,
             free_temp_storage: available_space,
             load: ((load.0 * 100.0).round() as u32 / self.static_info.hyperthreading_multiplier),
@@ -434,11 +425,9 @@ impl LinuxSystem {
     ///
     /// A `Result` containing a tuple of total space and available space in bytes.
     fn read_temp_storage(&self) -> Result<(u64, u64)> {
-        let mut diskinfo_guard = self
-            .diskinfo
-            .lock()
-            .map_err(|err| miette!("Failed to acquire diskinfo lock. {}", err))?;
-        let tmp_disk = diskinfo_guard.list_mut().iter_mut().find(|disk| {
+        let mut diskinfo =
+            Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
+        let tmp_disk = diskinfo.list_mut().iter_mut().find(|disk| {
             self.config.temp_path.starts_with(
                 disk.mount_point()
                     .to_str()
@@ -447,7 +436,7 @@ impl LinuxSystem {
         });
         match tmp_disk {
             Some(disk) => {
-                disk.refresh_specifics(DiskRefreshKind::nothing().with_storage());
+                disk.refresh_specifics(DiskRefreshKind::everything());
                 Ok((disk.total_space(), disk.available_space()))
             }
             None => Err(miette!(
@@ -683,11 +672,7 @@ impl SystemController for LinuxSystem {
 mod tests {
     use super::LinuxSystem;
     use crate::config::config::MachineConfig;
-    use std::{
-        fs,
-        sync::{Arc, Mutex},
-    };
-    use sysinfo::{Disks, System};
+    use std::fs;
 
     #[test]
     /// Use this unit test to quickly exercice a single cpuinfo file by changing the path on the
@@ -701,10 +686,8 @@ mod tests {
         config.proc_stat_path = "".to_string();
         config.inittab_path = "".to_string();
         config.core_multiplier = 1;
-        let sysinfo = Arc::new(Mutex::new(System::new()));
-        let diskinfo = Arc::new(Mutex::new(Disks::new()));
 
-        let linux_monitor = LinuxSystem::init(&config, sysinfo, diskinfo)
+        let linux_monitor = LinuxSystem::init(&config)
             .expect("Initializing LinuxMachineStat failed")
             .static_info;
         assert_eq!(4, linux_monitor.num_procs);
@@ -822,11 +805,7 @@ mod tests {
         config.inittab_path = "".to_string();
         config.core_multiplier = 1;
 
-        let sysinfo = Arc::new(Mutex::new(System::new()));
-        let diskinfo = Arc::new(Mutex::new(Disks::new()));
-
-        let stat = LinuxSystem::init(&config, sysinfo, diskinfo)
-            .expect("Initializing LinuxMachineStat failed");
+        let stat = LinuxSystem::init(&config).expect("Initializing LinuxMachineStat failed");
         let static_info = stat.static_info;
 
         // Proc
@@ -910,10 +889,7 @@ mod tests {
     mod tests {
         // ... existing imports ...
 
-        use std::{
-            collections::HashMap,
-            sync::{Arc, Mutex},
-        };
+        use std::collections::HashMap;
 
         use itertools::Itertools;
         use opencue_proto::host::HardwareState;
@@ -1029,8 +1005,6 @@ mod tests {
 
             LinuxSystem {
                 config: MachineConfig::default(),
-                sysinfo: Arc::new(Mutex::new(sysinfo::System::new())),
-                diskinfo: Arc::new(Mutex::new(sysinfo::Disks::new())),
                 procid_by_physid_and_core_id,
                 physid_and_coreid_by_procid,
                 cpu_stat: CpuStat {

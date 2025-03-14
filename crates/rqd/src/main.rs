@@ -1,13 +1,9 @@
-use std::{
-    str::FromStr,
-    sync::{Arc, Mutex},
-};
+use std::{str::FromStr, sync::Arc};
 
 use config::config::Config;
 use frame::{cache::RunningFrameCache, manager::FrameManager};
 use miette::IntoDiagnostic;
 use report_client::ReportClient;
-use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
 use system::machine::MachineMonitor;
 use tracing::warn;
 use tracing_rolling_file::{RollingConditionBase, RollingFileAppenderBase};
@@ -49,19 +45,11 @@ async fn main() -> miette::Result<()> {
     let config_clone = config.clone();
     let running_frame_cache_clone = Arc::clone(&running_frame_cache);
 
-    // Initialize sysinfo collectors
-    let sysinfo = Arc::new(Mutex::new(System::new_with_specifics(
-        RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
-    )));
-    let diskinfo = Arc::new(Mutex::new(Disks::new_with_refreshed_list()));
-
     // Initialize rqd machine monitor
     let machine_monitor = Arc::new(MachineMonitor::init(
         &config_clone,
         report_client,
         Arc::clone(&running_frame_cache_clone),
-        sysinfo,
-        diskinfo,
     )?);
     let mm_clone = Arc::clone(&machine_monitor);
     let mm_clone2 = Arc::clone(&machine_monitor);

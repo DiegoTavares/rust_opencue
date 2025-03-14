@@ -11,7 +11,6 @@ use opencue_proto::{
     host::HardwareState,
     report::{ChildrenProcStats, CoreDetail, RenderHost},
 };
-use sysinfo::{Disks, System};
 use thiserror::Error;
 use tokio::{
     select,
@@ -71,11 +70,8 @@ impl MachineMonitor {
         config: &Config,
         report_client: Arc<ReportClient>,
         running_frames_cache: Arc<RunningFrameCache>,
-        sysinfo: Arc<SyncMutex<System>>,
-        diskinfo: Arc<SyncMutex<Disks>>,
     ) -> Result<Self> {
-        let system_controller: SystemControllerType =
-            Box::new(LinuxSystem::init(&config.machine, sysinfo, diskinfo)?);
+        let system_controller: SystemControllerType = Box::new(LinuxSystem::init(&config.machine)?);
         // TODO: identify which OS is running and initialize stats_collector accordingly
         Ok(Self {
             maching_config: config.machine.clone(),
