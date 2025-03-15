@@ -182,11 +182,18 @@ impl MachineMonitor {
         let mut stream = tokio_stream::iter(self.running_frames_cache.iter_mut());
         while let Some(mut running_frame) = stream.next().await {
             if let Some(pid) = running_frame.pid() {
-                let proc_stats = system_monitor.collect_proc_stats(pid)?;
-                Arc::get_mut(running_frame.deref_mut())
-                    .unwrap()
-                    .frame_stats
-                    .replace(proc_stats);
+                if let Some(proc_stats) =
+                    system_monitor.collect_proc_stats(pid, running_frame.log_path.clone())?
+                {
+                    // let frame_stats = Arc::running_frame.deref_mut().frame_stats;
+                    let frame_stats =
+                        &mut Arc::get_mut(running_frame.deref_mut()).unwrap().frame_stats;
+                    if let Some(old_frame_stats) = frame_stats {
+                        old_frame_stats.update(proc_stats);
+                    } else {
+                        frame_stats.replace(proc_stats);
+                    }
+                }
             }
         }
         Ok(())
@@ -388,7 +395,7 @@ pub struct ProcessStats {
     pub max_vsize: u64,
     /// Current virtual memory size (KB) - amount of virtual memory currently in use.
     pub vsize: u64,
-    /// Last level cache utilization time.
+    /// Last time the log was updated
     pub llu_time: u64,
     /// Maximum GPU memory usage (KB).
     pub max_used_gpu_memory: u64,
@@ -416,6 +423,22 @@ impl Default for ProcessStats {
                 .unwrap_or_else(|_| std::time::Duration::from_secs(0))
                 .as_secs(),
         }
+    }
+}
+
+/// Get the max between two u64s
+fn max_u64(left: u64, right: u64) -> u64 {
+    (left > right).then(|| left).unwrap_or(right)
+}
+
+impl ProcessStats {
+    fn update(&mut self, new: Self) {
+        *self = ProcessStats {
+            max_rss: max_u64(new.max_rss, self.max_rss),
+            max_vsize: max_u64(new.max_vsize, self.max_vsize),
+            max_used_gpu_memory: max_u64(new.max_used_gpu_memory, self.max_used_gpu_memory),
+            ..new
+        };
     }
 }
 
@@ -463,7 +486,7 @@ pub trait SystemController {
     fn create_user_if_unexisting(&self, username: &str, uid: u32, gid: u32) -> Result<u32>;
 
     /// Collects stats of a process
-    fn collect_proc_stats(&self, pid: u32) -> Result<ProcessStats>;
+    fn collect_proc_stats(&self, pid: u32, log_path: String) -> Result<Option<ProcessStats>>;
 }
 
 #[derive(Debug, Clone, Diagnostic, Error)]

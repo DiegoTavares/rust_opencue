@@ -1,16 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, ErrorKind},
     net::ToSocketAddrs,
+    path::Path,
     process::Command,
+    time::UNIX_EPOCH,
 };
 
 use itertools::Itertools;
 use miette::{IntoDiagnostic, Result, miette};
 use opencue_proto::host::HardwareState;
-use sysinfo::{DiskRefreshKind, Disks, MemoryRefreshKind, RefreshKind};
-use tracing::info;
+use sysinfo::{DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind};
 use uuid::Uuid;
 
 use crate::config::config::MachineConfig;
@@ -87,7 +88,7 @@ impl LinuxSystem {
                 Self::read_distro(&config.distro_release_path).unwrap_or("linux".to_string())
             });
 
-        // Initialize sysinfo collectors
+        // Initialize sysinfo collector
         let sysinfo = sysinfo::System::new_with_specifics(
             RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
         );
@@ -662,9 +663,36 @@ impl SystemController for LinuxSystem {
         }
     }
 
-    fn collect_proc_stats(&self, pid: u32) -> Result<ProcessStats> {
-        // Next
-        todo!()
+    fn collect_proc_stats(&self, pid: u32, log_path: String) -> Result<Option<ProcessStats>> {
+        let sysinfo = sysinfo::System::new_with_specifics(
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
+        );
+        // Latest log modified time in epoch seconds. Defaults to zero if the metadata is not
+        // accessible.
+        let log_mtime = std::fs::metadata(Path::new(&log_path))
+            .and_then(|metadata| metadata.modified())
+            .and_then(|mtime| {
+                mtime
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|err| std::io::Error::new(ErrorKind::Other, err))
+            })
+            .unwrap_or_default()
+            .as_secs();
+
+        Ok(sysinfo
+            .process(Pid::from(pid as usize))
+            .map(|proc| ProcessStats {
+                // Caller is responsible for maintaining the Max value between calls
+                max_rss: proc.memory(),
+                rss: proc.memory(),
+                max_vsize: proc.virtual_memory(),
+                vsize: proc.virtual_memory(),
+                llu_time: log_mtime,
+                max_used_gpu_memory: 0,
+                used_gpu_memory: 0,
+                children: None,
+                epoch_start_time: proc.start_time(),
+            }))
     }
 }
 
