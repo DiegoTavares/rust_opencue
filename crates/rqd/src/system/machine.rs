@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    ops::DerefMut,
-    sync::{Arc, Mutex as SyncMutex},
+    sync::Arc,
     time::Instant,
 };
 
@@ -20,13 +19,15 @@ use tokio::{
     },
     time,
 };
-use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
     config::config::{Config, MachineConfig},
-    frame::cache::RunningFrameCache,
+    frame::{
+        cache::RunningFrameCache,
+        running_frame::{self, RunningFrame},
+    },
     report_client::{ReportClient, ReportInterface},
 };
 use serde::{Deserialize, Serialize};
@@ -59,7 +60,7 @@ pub struct MachineMonitor {
     pub system_controller: Mutex<SystemControllerType>,
     pub running_frames_cache: Arc<RunningFrameCache>,
     core_state: Arc<Mutex<Option<CoreDetail>>>,
-    host_state: Arc<Mutex<Option<RenderHost>>>,
+    last_host_state: Arc<Mutex<Option<RenderHost>>>,
     interrupt: Mutex<Option<Sender<()>>>,
 }
 
@@ -79,7 +80,7 @@ impl MachineMonitor {
             system_controller: Mutex::new(system_controller),
             running_frames_cache,
             core_state: Arc::new(Mutex::new(None)),
-            host_state: Arc::new(Mutex::new(None)),
+            last_host_state: Arc::new(Mutex::new(None)),
             interrupt: Mutex::new(None),
         })
     }
@@ -92,7 +93,10 @@ impl MachineMonitor {
         let host_state = Self::inspect_host_state(&self.maching_config, &stats_collector_lock)?;
         drop(stats_collector_lock);
 
-        self.host_state.lock().await.replace(host_state.clone());
+        self.last_host_state
+            .lock()
+            .await
+            .replace(host_state.clone());
         let total_cores = host_state.num_procs * self.maching_config.core_multiplier as i32;
         let initial_core_state = CoreDetail {
             total_cores,
@@ -158,13 +162,17 @@ impl MachineMonitor {
         let stats_collector_lock = self.system_controller.lock().await;
         let host_state = Self::inspect_host_state(&self.maching_config, &stats_collector_lock)?;
         drop(stats_collector_lock);
+        // Store the last host_state on self
+        let mut self_host_state_lock = self.last_host_state.lock().await;
+        self_host_state_lock.replace(host_state.clone());
+        drop(self_host_state_lock);
 
         let core_state_guard = self.core_state.lock().await;
         let core_state = core_state_guard
             .as_ref()
             .expect("A state must be set at this point");
 
-        self.collect_running_frames_stats().await?;
+        self.monitor_running_frames().await?;
 
         debug!("Sending host report: {:?}", host_state);
         report_client
@@ -177,26 +185,72 @@ impl MachineMonitor {
         Ok(())
     }
 
-    async fn collect_running_frames_stats(&self) -> Result<()> {
+    async fn monitor_running_frames(&self) -> Result<()> {
         let system_monitor = self.system_controller.lock().await;
-        let mut stream = tokio_stream::iter(self.running_frames_cache.iter_mut());
-        while let Some(mut running_frame) = stream.next().await {
+        let mut finished_frames: Vec<Arc<RunningFrame>> = Vec::new();
+
+        self.running_frames_cache.retain(|_, running_frame| {
+            // A frame that hasn't properly started will not have a pid
             if let Some(pid) = running_frame.pid() {
-                if let Some(proc_stats) =
-                    system_monitor.collect_proc_stats(pid, running_frame.log_path.clone())?
+                if running_frame.finished() {
+                    finished_frames.push(Arc::clone(running_frame));
+                    false
+                } else if let Some(proc_stats) = system_monitor
+                    .collect_proc_stats(pid, running_frame.log_path.clone())
+                    .unwrap_or_else(|err| {
+                        warn!("Failed to collect proc_stats. {}", err);
+                        None
+                    })
                 {
-                    // let frame_stats = Arc::running_frame.deref_mut().frame_stats;
-                    let frame_stats =
-                        &mut Arc::get_mut(running_frame.deref_mut()).unwrap().frame_stats;
-                    if let Some(old_frame_stats) = frame_stats {
-                        old_frame_stats.update(proc_stats);
-                    } else {
-                        frame_stats.replace(proc_stats);
+                    if let Ok(mut frame_stats) = running_frame.frame_stats.lock() {
+                        if let Some(old_frame_stats) = frame_stats.as_mut() {
+                            old_frame_stats.update(proc_stats);
+                        } else {
+                            *frame_stats = Some(proc_stats);
+                        }
                     }
+                    true
+                } else {
+                    warn!(
+                        "Removing {} from the cache. Could not find proc {} for frame that was supposed to be running.",
+                        running_frame.to_string(),
+                        pid
+                    );
+                    false
+                }
+            } else {
+                true
+            }
+        });
+        self.handle_finished_frames(finished_frames).await;
+        Ok(())
+    }
+
+    async fn handle_finished_frames(&self, finished_frames: Vec<Arc<RunningFrame>>) {
+        let host_state_lock = self.last_host_state.lock().await;
+        let host_state = host_state_lock.clone();
+        // Avoid holding a lock while reporting back to cuebot
+        drop(host_state_lock);
+
+        if let Some(host_state) = host_state {
+            for frame in finished_frames {
+                if let Some((exit_status, exit_signal_opt)) = frame.exit_status_and_signal() {
+                    let exit_signal = match exit_signal_opt {
+                        Some(signal) => signal as u32,
+                        None => 0,
+                    };
+                    self.report_client
+                        .send_frame_complete_report(
+                            host_state.clone(),
+                            frame.into_report(),
+                            exit_status as u32,
+                            exit_signal,
+                            0,
+                        )
+                        .await;
                 }
             }
         }
-        Ok(())
     }
 
     fn inspect_host_state(
@@ -272,7 +326,7 @@ pub trait Machine {
 #[async_trait]
 impl Machine for MachineMonitor {
     async fn hardware_state(&self) -> Option<HardwareState> {
-        self.host_state
+        self.last_host_state
             .lock()
             .await
             .as_ref()
@@ -280,7 +334,7 @@ impl Machine for MachineMonitor {
     }
 
     async fn nimby_locked(&self) -> bool {
-        self.host_state
+        self.last_host_state
             .lock()
             .await
             .as_ref()
@@ -332,7 +386,7 @@ impl Machine for MachineMonitor {
     }
 
     async fn get_host_name(&self) -> String {
-        let lock = self.host_state.lock().await;
+        let lock = self.last_host_state.lock().await;
 
         lock.as_ref()
             .map(|h| h.name.clone())

@@ -1639,7 +1639,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-postgres",
- "tokio-stream",
  "tonic",
  "tracing",
  "tracing-appender",

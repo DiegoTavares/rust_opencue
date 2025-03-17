@@ -197,7 +197,10 @@ impl FrameManager {
             let result = std::panic::catch_unwind(|| running_frame.run(recover_mode));
             if let Err(panic_info) = result {
                 running_frame.update_exit_code_and_signal(1, None);
-                error!("Run thread panicked: {:?}", panic_info);
+                error!(
+                    "Run thread panicked for {}: {:?}",
+                    running_frame, panic_info
+                );
             }
         });
         // Another option would be to use a blocking context from tokio.
