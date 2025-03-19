@@ -5,7 +5,7 @@ use std::{
     net::ToSocketAddrs,
     path::Path,
     process::Command,
-    sync::Mutex,
+    sync::{Mutex, MutexGuard},
     time::UNIX_EPOCH,
 };
 
@@ -13,8 +13,10 @@ use dashmap::DashMap;
 use itertools::Itertools;
 use miette::{IntoDiagnostic, Result, miette};
 use opencue_proto::host::HardwareState;
-use sysinfo::{DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind};
-use tracing::info;
+use sysinfo::{
+    DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System,
+};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::config::config::MachineConfig;
@@ -524,23 +526,86 @@ impl LinuxSystem {
         // Clear up cache
         self.children_procs_cache.clear();
 
-        for (parent_pid, children_pid) in
-            sysinfo
-                .processes()
-                .iter()
-                .filter_map(|(children_pid, proc)| {
-                    let parent_pid = proc.parent().unwrap_or(Pid::from_u32(0)).as_u32();
-                    if pids.contains(&parent_pid) {
-                        Some((parent_pid, children_pid.clone()))
-                    } else {
-                        None
-                    }
-                })
-        {
+        for (parent_pid, children_pid) in sysinfo.processes().iter().map(|(children_pid, proc)| {
+            let parent_pid = proc.parent().unwrap_or(Pid::from_u32(0)).as_u32();
+            (parent_pid, children_pid.clone())
+        }) {
             self.children_procs_cache
                 .entry(parent_pid)
                 .and_modify(|children| children.push(children_pid.as_u32()))
                 .or_insert(vec![children_pid.as_u32()]);
+        }
+    }
+
+    /// Recursively calculates memory usage of a process and all of its child processes.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - Process ID to calculate memory usage for
+    /// * `sysinfo` - Mutex guard containing system information
+    /// * `cycle_trace` - Vector of process IDs to detect recursive loops
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    /// * Memory usage in bytes
+    /// * Virtual memory usage in bytes
+    /// * GPU memory usage in bytes
+    /// * The updated mutex guard reference
+    /// * The updated cycle_trace vector
+    ///
+    /// # Implementation Notes
+    ///
+    /// This function recursively traverses the process tree to sum up memory usage.
+    /// It uses cycle detection to prevent infinite loops in process hierarchies.
+    fn calculate_children_memory<'a>(
+        &'a self,
+        pid: &u32,
+        mut sysinfo: MutexGuard<'a, System>,
+        mut cycle_trace: Vec<u32>,
+    ) -> (u64, u64, u64, MutexGuard<'a, System>, Vec<u32>) {
+        match sysinfo.process(Pid::from(pid.clone() as usize)) {
+            Some(proc) => match self.children_procs_cache.get(pid) {
+                Some(children_pids) => {
+                    cycle_trace.push(pid.clone());
+                    let (mut sum_memory, mut sum_virtual_memory, mut sum_gpu_memory) =
+                        (proc.memory(), proc.virtual_memory(), 0);
+                    for child_pid in children_pids.iter() {
+                        // Check for cycles to avoid an infinite loop
+                        if cycle_trace.contains(child_pid) {
+                            warn!(
+                                "calculate_children_memory recursion found a loop.\
+                                Incomplete memory calculation for {pid}."
+                            );
+                            break;
+                        }
+                        let (
+                            child_memory,
+                            child_virtual_memory,
+                            child_gpu_memory,
+                            updated_sysinfo,
+                            updated_cycle_trace,
+                        ) = self.calculate_children_memory(child_pid, sysinfo, cycle_trace);
+                        sum_memory += child_memory;
+                        sum_virtual_memory += child_virtual_memory;
+                        sum_gpu_memory += child_gpu_memory;
+                        // Update our reference to the mutex guard and cycle_trace
+                        sysinfo = updated_sysinfo;
+                        cycle_trace = updated_cycle_trace;
+                    }
+                    (
+                        sum_memory,
+                        sum_virtual_memory,
+                        sum_gpu_memory,
+                        sysinfo,
+                        cycle_trace,
+                    )
+                }
+                // Process has no children
+                None => (proc.memory(), proc.virtual_memory(), 0, sysinfo, Vec::new()),
+            },
+            // Process no longer exists
+            None => (0, 0, 0, sysinfo, Vec::new()),
         }
     }
 }
@@ -705,11 +770,6 @@ impl SystemController for LinuxSystem {
     }
 
     fn collect_proc_stats(&self, pid: u32, log_path: String) -> Result<Option<ProcessStats>> {
-        let sysinfo = self
-            .sysinfo_system
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-
         // Latest log modified time in epoch seconds. Defaults to zero if the metadata is not
         // accessible.
         let log_mtime = std::fs::metadata(Path::new(&log_path))
@@ -723,40 +783,31 @@ impl SystemController for LinuxSystem {
             .as_secs();
 
         // Summation of all children memory consumption
-        let (children_memory, children_virtual_memory, children_gpu_memory) = self
-            .children_procs_cache
-            .get(&pid)
-            .map(|children_pids| {
-                children_pids
-                    .iter()
-                    .map(
-                        |child_pid| match sysinfo.process(Pid::from(child_pid.clone() as usize)) {
-                            Some(proc) => (proc.memory(), proc.virtual_memory(), 0),
-                            None => (0, 0, 0),
-                        },
-                    )
-                    .reduce(|pid_a, pid_b| {
-                        (pid_a.0 + pid_b.0, pid_a.1 + pid_b.1, pid_a.2 + pid_b.2)
-                    })
-                    .unwrap_or((0, 0, 0))
-            })
-            .unwrap_or((0, 0, 0));
-        info!(
-            "child proc: {}, {}, {}",
-            children_memory, children_virtual_memory, children_gpu_memory
+        let sysinfo = self
+            .sysinfo_system
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let (summed_memory, summed_virtual_memory, summed_gpu_memory, guard, _) =
+            self.calculate_children_memory(&pid, sysinfo, Vec::new());
+        debug!(
+            "Collect frame stats fo {}. rss: {}mb virtual: {}mb gpu: {}mb",
+            pid,
+            summed_memory / 1024 / 1024,
+            summed_virtual_memory / 1024 / 1024,
+            summed_gpu_memory / 1024 / 1024
         );
 
-        Ok(sysinfo
+        Ok(guard
             .process(Pid::from(pid as usize))
             .map(|proc| ProcessStats {
                 // Caller is responsible for maintaining the Max value between calls
-                max_rss: proc.memory() + children_memory,
-                rss: proc.memory() + children_memory,
-                max_vsize: proc.virtual_memory() + children_virtual_memory,
-                vsize: proc.virtual_memory() + children_virtual_memory,
+                max_rss: summed_memory,
+                rss: summed_memory,
+                max_vsize: summed_virtual_memory,
+                vsize: summed_virtual_memory,
                 llu_time: log_mtime,
                 max_used_gpu_memory: 0,
-                used_gpu_memory: 0 + children_gpu_memory,
+                used_gpu_memory: summed_gpu_memory,
                 children: None,
                 epoch_start_time: proc.start_time(),
             }))
@@ -772,8 +823,6 @@ impl SystemController for LinuxSystem {
             RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
         );
         drop(sysinfo);
-        info!("Updated procs info");
-
         self.refresh_children_procs_cache(pids);
     }
 }
