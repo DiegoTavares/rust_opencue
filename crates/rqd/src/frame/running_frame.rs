@@ -11,7 +11,7 @@ use std::{
     path::Path,
     sync::{Arc, Mutex, mpsc::Receiver},
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use std::{os::unix::process::ExitStatusExt, sync::mpsc};
 use std::{process::Stdio, thread};
@@ -48,42 +48,60 @@ pub struct RunningFrame {
     raw_stdout_path: String,
     raw_stderr_path: String,
     pub exit_file_path: String,
-    // state: Mutex<FrameState>,
-    #[serde(serialize_with = "serialize_running_state")]
-    #[serde(deserialize_with = "deserialize_running_state")]
-    running_state: Mutex<RunningState>,
-    finished_state: Mutex<Option<FinishedState>>,
+    state: Mutex<FrameState>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum FrameState {
-    Created,
+    Created(CreatedState),
     Running(RunningState),
     Finished(FinishedState),
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct RunningState {
-    pid: Option<u32>,
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CreatedState {
     #[serde(skip_serializing)]
     #[serde(skip_deserializing)]
-    #[serde(default = "none_value")]
-    launch_thread_handle: Option<JoinHandle<()>>,
+    launch_thread_handle: Arc<Option<JoinHandle<()>>>,
 }
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct RunningState {
+    pid: Option<u32>,
+    start_time: SystemTime,
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    launch_thread_handle: Arc<Option<JoinHandle<()>>>,
+}
+
 impl RunningState {
-    fn default() -> RunningState {
-        RunningState {
-            pid: None,
-            launch_thread_handle: None,
+    fn into_finished(
+        &self,
+        exit_code: i32,
+        exit_signal: Option<i32>,
+        end_time: SystemTime,
+    ) -> FinishedState {
+        FinishedState {
+            pid: self.pid,
+            launch_thread_handle: Arc::clone(&self.launch_thread_handle),
+            start_time: self.start_time,
+            end_time,
+            exit_code,
+            exit_signal,
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct FinishedState {
-    // pid: Option<u32>,
-    exit_code: i32,
-    exit_signal: Option<i32>,
+    pub pid: Option<u32>,
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    launch_thread_handle: Arc<Option<JoinHandle<()>>>,
+    pub start_time: SystemTime,
+    pub end_time: SystemTime,
+    pub exit_code: i32,
+    pub exit_signal: Option<i32>,
 }
 
 impl Display for RunningFrame {
@@ -158,13 +176,26 @@ impl RunningFrame {
             raw_stdout_path,
             raw_stderr_path,
             exit_file_path,
-            running_state: Mutex::new(RunningState::default()),
-            finished_state: Mutex::new(None),
+            state: Mutex::new(FrameState::Created(CreatedState {
+                launch_thread_handle: Arc::new(None),
+            })),
         }
     }
 
-    pub fn state(&self) -> Result<RunningState, FinishedState> {
-        todo!()
+    pub fn get_finished_state(&self) -> Option<FinishedState> {
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        match *state {
+            FrameState::Created(_) => None,
+            FrameState::Running(_) => None,
+            FrameState::Finished(ref finished_state) => Some(FinishedState {
+                pid: finished_state.pid,
+                launch_thread_handle: Arc::clone(&finished_state.launch_thread_handle),
+                start_time: finished_state.start_time,
+                end_time: finished_state.end_time,
+                exit_code: finished_state.exit_code,
+                exit_signal: finished_state.exit_signal,
+            }),
+        }
     }
 
     /// Updates the launch thread handle for this running frame
@@ -175,12 +206,19 @@ impl RunningFrame {
     /// This method is used to store the handle of the thread responsible
     /// for launching and monitoring this frame. It allows the system to
     /// properly manage the thread lifecycle.
-    pub fn update_launch_thread_handle(&self, thread_handle: JoinHandle<()>) {
-        let mut state = self
-            .running_state
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        state.launch_thread_handle = Some(thread_handle);
+    pub fn update_launch_thread_handle(&self, thread_handle: JoinHandle<()>) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        match *state {
+            FrameState::Created(ref mut created_state) => {
+                created_state.launch_thread_handle = Arc::new(Some(thread_handle));
+                Ok(())
+            }
+            FrameState::Running(ref mut running_state) => {
+                running_state.launch_thread_handle = Arc::new(Some(thread_handle));
+                Ok(())
+            }
+            FrameState::Finished(_) => Err(miette!("Invalid State. Frame has already finished")),
+        }
     }
 
     /// Updates the exit code and signal for this frame
@@ -191,23 +229,47 @@ impl RunningFrame {
     ///
     /// This method updates the internal finished state with the termination information,
     /// which can later be used to determine if the frame succeeded or failed.
-    pub fn update_exit_code_and_signal(&self, exit_code: i32, exit_signal: Option<i32>) {
-        let mut state = self
-            .finished_state
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        state.replace(FinishedState {
-            exit_code,
-            exit_signal,
-        });
+    pub fn finish(&self, exit_code: i32, exit_signal: Option<i32>) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        match *state {
+            FrameState::Created(_) => Err(miette!("Invalid State. Frame {} hasn't started", self)),
+            FrameState::Running(ref mut running_state) => {
+                *state = FrameState::Finished(running_state.into_finished(
+                    exit_code,
+                    exit_signal,
+                    SystemTime::now(),
+                ));
+                Ok(())
+            }
+            FrameState::Finished(_) => Err(miette!(
+                "Invalid State. Frame {} has already finished",
+                self
+            )),
+        }
     }
 
-    fn update_pid(&self, pid: u32) {
-        let mut state = self
-            .running_state
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        state.pid = Some(pid);
+    fn start(&self, pid: u32) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+
+        match *state {
+            FrameState::Created(ref created_state) => {
+                *state = FrameState::Running(RunningState {
+                    pid: Some(pid),
+                    start_time: SystemTime::now(),
+                    launch_thread_handle: Arc::clone(&created_state.launch_thread_handle),
+                });
+                Ok(())
+            }
+            FrameState::Running(ref running_state) => Err(miette!(
+                "Invalid State. Frame {} has already started {:?}",
+                self,
+                running_state
+            )),
+            FrameState::Finished(_) => Err(miette!(
+                "Invalid State. Frame {} has already finished",
+                self
+            )),
+        }
     }
 
     fn setup_env_vars(
@@ -272,7 +334,9 @@ impl RunningFrame {
         let exit_code = if recover_mode {
             match self.recover_inner(Arc::clone(&logger)) {
                 Ok((exit_code, exit_signal)) => {
-                    self.update_exit_code_and_signal(exit_code, exit_signal);
+                    if let Err(err) = self.finish(exit_code, exit_signal) {
+                        warn!("Failed to mark frame {} as finished. {}", self, err);
+                    }
                     Some(exit_code)
                 }
                 Err(err) => {
@@ -285,7 +349,9 @@ impl RunningFrame {
         } else {
             match self.run_inner(Arc::clone(&logger)) {
                 Ok((exit_code, exit_signal)) => {
-                    self.update_exit_code_and_signal(exit_code, exit_signal);
+                    if let Err(err) = self.finish(exit_code, exit_signal) {
+                        warn!("Failed to mark frame {} as finished. {}", self, err);
+                    }
                     Some(exit_code)
                 }
                 Err(err) => {
@@ -366,7 +432,7 @@ impl RunningFrame {
 
         // Update frame state with frame pid
         let pid = child.id();
-        self.update_pid(child.id());
+        self.start(child.id())?;
 
         info!(
             "Frame {self} started with pid {pid}, with taskset {}",
@@ -497,10 +563,12 @@ impl RunningFrame {
     /// This method safely accesses the thread-protected running state to retrieve
     /// the current PID of the frame process.
     pub(crate) fn pid(&self) -> Option<u32> {
-        self.running_state
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .pid
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        match *state {
+            FrameState::Created(_) => None,
+            FrameState::Running(ref running_state) => running_state.pid,
+            FrameState::Finished(ref finished_state) => finished_state.pid,
+        }
     }
 
     /// Reads the exit status from the exit file written by the frame process
@@ -671,15 +739,10 @@ impl RunningFrame {
     }
 
     fn snapshot_path(&self) -> Result<String> {
-        let pid = self
-            .running_state
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .pid
-            .ok_or_else(|| {
-                warn!("Failed to snapshot frame {}. No pid available", self);
-                miette!("No pid available for frame snapshot")
-            })?;
+        let pid = self.pid().ok_or_else(|| {
+            warn!("Failed to snapshot frame {}. No pid available", self);
+            miette!("No pid available for frame snapshot")
+        })?;
 
         Ok(format!(
             "{}/snapshot_{}-{}-{}.bin",
@@ -745,11 +808,8 @@ impl RunningFrame {
         // Replace snapshot config with the new config:
         frame.config = config;
 
-        let pid = frame
-            .running_state
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .pid;
+        let pid = frame.pid();
+
         // Check if pid is still active
         match pid {
             Some(pid) => Self::is_process_running(pid).then(|| pid).ok_or(miette!(
@@ -771,30 +831,28 @@ impl RunningFrame {
         system.process(Pid::from_u32(pid)).is_some()
     }
 
-    pub fn finished(&self) -> bool {
-        let running_state = self
-            .running_state
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
+    pub fn is_finished(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
 
-        let thread_finished = running_state
-            .launch_thread_handle
-            .as_ref()
-            .map(|handle| handle.is_finished())
-            .unwrap_or(false);
-        let pid_running = running_state
-            .pid
-            .map(|pid| Self::is_process_running(pid))
-            .clone()
-            .unwrap_or(false);
-        drop(running_state);
-
-        let finished_state = self
-            .finished_state
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-
-        thread_finished && finished_state.is_some() && !pid_running
+        match *state {
+            FrameState::Created(_) => false,
+            FrameState::Running(_) => false,
+            FrameState::Finished(ref finished_state) => {
+                let thread_finished = match &*finished_state.launch_thread_handle {
+                    Some(handle) => handle.is_finished(),
+                    None => {
+                        info!("Thread handle missing");
+                        true
+                    }
+                };
+                let pid_running = finished_state
+                    .pid
+                    .map(|pid| Self::is_process_running(pid))
+                    .clone()
+                    .unwrap_or(false);
+                thread_finished && !pid_running
+            }
+        }
     }
 
     fn write_header(&self) -> String {
@@ -853,74 +911,46 @@ Environment Variables:
             .join(",")
     }
 
-    pub fn exit_status_and_signal(&self) -> Option<(i32, Option<i32>)> {
-        let finished_state = self
-            .finished_state
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        match *finished_state {
-            Some(ref state) => Some((state.exit_code, state.exit_signal)),
-            None => None,
+    pub fn into_report(&self) -> Option<RunningFrameInfo> {
+        if let Some(finished_state) = self.get_finished_state() {
+            let frame_stats_lock = self
+                .frame_stats
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            if let Some(ref stats) = *frame_stats_lock {
+                Some(RunningFrameInfo {
+                    resource_id: self.request.resource_id.clone(),
+                    job_id: self.request.job_id.clone(),
+                    job_name: self.request.job_name.clone(),
+                    frame_id: self.request.frame_id.clone(),
+                    frame_name: self.request.frame_name.clone(),
+                    layer_id: self.request.layer_id.clone(),
+                    num_cores: self.request.num_cores,
+                    start_time: finished_state
+                        .start_time
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs() as i64,
+                    max_rss: stats.max_rss as i64,
+                    rss: stats.rss as i64,
+                    max_vsize: stats.max_vsize as i64,
+                    vsize: stats.vsize as i64,
+                    attributes: self.request.attributes.clone(),
+                    llu_time: stats.llu_time as i64,
+                    num_gpus: self.request.num_gpus,
+                    max_used_gpu_memory: stats.max_used_gpu_memory as i64,
+                    used_gpu_memory: stats.used_gpu_memory as i64,
+                    // Not recording proc children for now
+                    children: None,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
         }
     }
-
-    pub fn into_report(&self) -> RunningFrameInfo {
-        todo!()
-        // RunningFrameInfo {
-        //     resource_id: self.request.resource_id,
-        //     job_id: self.request.job_id,
-        //     job_name: self.request.job_name,
-        //     frame_id: self.request.frame_id,
-        //     frame_name: self.request.frame_name,
-        //     layer_id: self.request.layer_id,
-        //     num_cores: self.request.num_cores,
-        //     start_time: todo!(),
-        //     max_rss: self.request.max_rss,
-        //     rss: self.request.rss,
-        //     max_vsize: self.request.max_vsize,
-        //     vsize: self.request.vsize,
-        //     attributes: self.request.attributes,
-        //     llu_time: self.request.llu_time,
-        //     num_gpus: self.request.num_gpus,
-        //     max_used_gpu_memory: self.request.max_used_gpu_memory,
-        //     used_gpu_memory: self.request.used_gpu_memory,
-        //     children: self.request.children,
-        // }
-    }
 }
-
-// ===Serialize/Deserialize helpers===
-fn none_value() -> Option<JoinHandle<()>> {
-    None
-}
-
-fn serialize_running_state<S>(state: &Mutex<RunningState>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    // We only care about serializing the contents, not the mutex itself
-    let guard = state.lock().unwrap_or_else(|err| err.into_inner());
-    // Serialize just the RunningState data
-    RunningState {
-        pid: guard.pid,
-        launch_thread_handle: None, // We don't want to serialize the thread handle
-    }
-    .serialize(serializer)
-}
-
-// Custom deserialization for Mutex<RunningState>
-fn deserialize_running_state<'de, D>(deserializer: D) -> Result<Mutex<RunningState>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    // Deserialize into a RunningState first
-    let state = RunningState::deserialize(deserializer)?;
-
-    // Then wrap it in an Arc<Mutex<_>>
-    Ok(Mutex::new(state))
-}
-
-// ===End Serialize/Deserialize helpers===
 
 #[cfg(test)]
 mod tests {

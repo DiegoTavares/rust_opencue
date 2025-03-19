@@ -24,10 +24,7 @@ use uuid::Uuid;
 
 use crate::{
     config::config::{Config, MachineConfig},
-    frame::{
-        cache::RunningFrameCache,
-        running_frame::{self, RunningFrame},
-    },
+    frame::{cache::RunningFrameCache, running_frame::RunningFrame},
     report_client::{ReportClient, ReportInterface},
 };
 use serde::{Deserialize, Serialize};
@@ -138,7 +135,8 @@ impl MachineMonitor {
                     }
                 }
                 _ = interval.tick() => {
-                    self.collect_host_report().await?;
+                    self.update_procs().await;
+                    self.collect_and_send_host_report().await?;
                 }
             }
         }
@@ -157,11 +155,16 @@ impl MachineMonitor {
         }
     }
 
-    async fn collect_host_report(&self) -> Result<()> {
+    async fn update_procs(&self) {
+        let system_controller = self.system_controller.lock().await;
+        system_controller.update_procs(self.running_frames_cache.pids());
+    }
+
+    async fn collect_and_send_host_report(&self) -> Result<()> {
         let report_client = self.report_client.clone();
-        let stats_collector_lock = self.system_controller.lock().await;
-        let host_state = Self::inspect_host_state(&self.maching_config, &stats_collector_lock)?;
-        drop(stats_collector_lock);
+        let system_controller = self.system_controller.lock().await;
+        let host_state = Self::inspect_host_state(&self.maching_config, &system_controller)?;
+        drop(system_controller);
         // Store the last host_state on self
         let mut self_host_state_lock = self.last_host_state.lock().await;
         self_host_state_lock.replace(host_state.clone());
@@ -192,7 +195,7 @@ impl MachineMonitor {
         self.running_frames_cache.retain(|_, running_frame| {
             // A frame that hasn't properly started will not have a pid
             if let Some(pid) = running_frame.pid() {
-                if running_frame.finished() {
+                if running_frame.is_finished() {
                     finished_frames.push(Arc::clone(running_frame));
                     false
                 } else if let Some(proc_stats) = system_monitor
@@ -234,20 +237,32 @@ impl MachineMonitor {
 
         if let Some(host_state) = host_state {
             for frame in finished_frames {
-                if let Some((exit_status, exit_signal_opt)) = frame.exit_status_and_signal() {
-                    let exit_signal = match exit_signal_opt {
+                if let (Some(finished_state), Some(frame_report)) =
+                    (frame.get_finished_state(), frame.into_report())
+                {
+                    let exit_signal = match finished_state.exit_signal {
                         Some(signal) => signal as u32,
                         None => 0,
                     };
-                    self.report_client
+
+                    if let Err(err) = self
+                        .report_client
                         .send_frame_complete_report(
                             host_state.clone(),
-                            frame.into_report(),
-                            exit_status as u32,
+                            frame_report,
+                            finished_state.exit_code as u32,
                             exit_signal,
                             0,
                         )
-                        .await;
+                        .await
+                    {
+                        error!(
+                            "Failed to send frame_complete_report for {}. {}",
+                            frame, err
+                        );
+                    };
+                } else {
+                    warn!("Invalid state on supposedly finished frame. {}", frame);
                 }
             }
         }
@@ -541,6 +556,9 @@ pub trait SystemController {
 
     /// Collects stats of a process
     fn collect_proc_stats(&self, pid: u32, log_path: String) -> Result<Option<ProcessStats>>;
+
+    /// Update info about procs currently active
+    fn update_procs(&self, pids: Vec<u32>);
 }
 
 #[derive(Debug, Clone, Diagnostic, Error)]

@@ -196,19 +196,19 @@ impl FrameManager {
         let thread_handle = std::thread::spawn(move || {
             let result = std::panic::catch_unwind(|| running_frame.run(recover_mode));
             if let Err(panic_info) = result {
-                running_frame.update_exit_code_and_signal(1, None);
+                _ = running_frame.finish(1, None);
                 error!(
                     "Run thread panicked for {}: {:?}",
                     running_frame, panic_info
                 );
             }
         });
-        // Another option would be to use a blocking context from tokio.
-        // let _t = tokio::task::spawn_blocking(move || running_frame.run());
-
-        // Store the thread handle for bookeeping
-        // TODO: Implement logic that checks if the thread is alive during monitoring
-        running_frame_ref.update_launch_thread_handle(thread_handle);
+        if let Err(err) = running_frame_ref.update_launch_thread_handle(thread_handle) {
+            warn!(
+                "Failed to update thread handle for frame {}. {}",
+                running_frame_ref, err
+            );
+        }
     }
 
     fn validate_grpc_frame(&self, run_frame: &RunFrame) -> Result<(), FrameManagerError> {

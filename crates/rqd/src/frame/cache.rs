@@ -64,19 +64,15 @@ impl RunningFrameCache {
         self.cache.insert(running_frame.frame_id, running_frame)
     }
 
-    pub fn remove(&self, frame_id: &Uuid) -> Option<Arc<RunningFrame>> {
-        self.cache.remove(frame_id).map(|rf| rf.1)
-    }
-
     pub fn contains(&self, frame_id: &Uuid) -> bool {
         self.cache.contains_key(frame_id)
     }
 
-    pub fn iter_mut(&self) -> dashmap::iter::IterMut<'_, Uuid, Arc<RunningFrame>> {
-        self.cache.iter_mut()
-    }
-
     pub fn retain(&self, f: impl FnMut(&Uuid, &mut Arc<RunningFrame>) -> bool) {
         self.cache.retain(f);
+    }
+
+    pub fn pids(&self) -> Vec<u32> {
+        self.cache.iter().filter_map(|ref v| v.pid()).collect()
     }
 }

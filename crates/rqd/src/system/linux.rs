@@ -5,13 +5,16 @@ use std::{
     net::ToSocketAddrs,
     path::Path,
     process::Command,
+    sync::Mutex,
     time::UNIX_EPOCH,
 };
 
+use dashmap::DashMap;
 use itertools::Itertools;
 use miette::{IntoDiagnostic, Result, miette};
 use opencue_proto::host::HardwareState;
 use sysinfo::{DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::config::config::MachineConfig;
@@ -32,6 +35,9 @@ pub struct LinuxSystem {
     static_info: MachineStaticInfo,
     hardware_state: HardwareState,
     attributes: HashMap<String, String>,
+    sysinfo_system: Mutex<sysinfo::System>,
+    // Stores a cache of each monitored process' list of children processes
+    children_procs_cache: DashMap<u32, Vec<u32>>,
 }
 
 struct MemInfoData {
@@ -130,6 +136,8 @@ impl LinuxSystem {
                 reserved_cores_by_physid: HashMap::new(),
                 available_cores: available_core_count,
             },
+            sysinfo_system: Mutex::new(sysinfo::System::new()),
+            children_procs_cache: DashMap::new(),
         })
     }
 
@@ -502,6 +510,39 @@ impl LinuxSystem {
 
         Ok(available_cores.collect())
     }
+
+    /// Refresh the cache of children procs.
+    ///
+    /// This method relies on sysinfo to have been updated periodically
+    /// throught the read_dynamic_stat method to gather the updated list
+    /// of running processes
+    fn refresh_children_procs_cache(&self, pids: Vec<u32>) {
+        let sysinfo = self
+            .sysinfo_system
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // Clear up cache
+        self.children_procs_cache.clear();
+
+        for (parent_pid, children_pid) in
+            sysinfo
+                .processes()
+                .iter()
+                .filter_map(|(children_pid, proc)| {
+                    let parent_pid = proc.parent().unwrap_or(Pid::from_u32(0)).as_u32();
+                    if pids.contains(&parent_pid) {
+                        Some((parent_pid, children_pid.clone()))
+                    } else {
+                        None
+                    }
+                })
+        {
+            self.children_procs_cache
+                .entry(parent_pid)
+                .and_modify(|children| children.push(children_pid.as_u32()))
+                .or_insert(vec![children_pid.as_u32()]);
+        }
+    }
 }
 
 impl SystemController for LinuxSystem {
@@ -664,9 +705,11 @@ impl SystemController for LinuxSystem {
     }
 
     fn collect_proc_stats(&self, pid: u32, log_path: String) -> Result<Option<ProcessStats>> {
-        let sysinfo = sysinfo::System::new_with_specifics(
-            RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
-        );
+        let sysinfo = self
+            .sysinfo_system
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
         // Latest log modified time in epoch seconds. Defaults to zero if the metadata is not
         // accessible.
         let log_mtime = std::fs::metadata(Path::new(&log_path))
@@ -679,20 +722,59 @@ impl SystemController for LinuxSystem {
             .unwrap_or_default()
             .as_secs();
 
+        // Summation of all children memory consumption
+        let (children_memory, children_virtual_memory, children_gpu_memory) = self
+            .children_procs_cache
+            .get(&pid)
+            .map(|children_pids| {
+                children_pids
+                    .iter()
+                    .map(
+                        |child_pid| match sysinfo.process(Pid::from(child_pid.clone() as usize)) {
+                            Some(proc) => (proc.memory(), proc.virtual_memory(), 0),
+                            None => (0, 0, 0),
+                        },
+                    )
+                    .reduce(|pid_a, pid_b| {
+                        (pid_a.0 + pid_b.0, pid_a.1 + pid_b.1, pid_a.2 + pid_b.2)
+                    })
+                    .unwrap_or((0, 0, 0))
+            })
+            .unwrap_or((0, 0, 0));
+        info!(
+            "child proc: {}, {}, {}",
+            children_memory, children_virtual_memory, children_gpu_memory
+        );
+
         Ok(sysinfo
             .process(Pid::from(pid as usize))
             .map(|proc| ProcessStats {
                 // Caller is responsible for maintaining the Max value between calls
-                max_rss: proc.memory(),
-                rss: proc.memory(),
-                max_vsize: proc.virtual_memory(),
-                vsize: proc.virtual_memory(),
+                max_rss: proc.memory() + children_memory,
+                rss: proc.memory() + children_memory,
+                max_vsize: proc.virtual_memory() + children_virtual_memory,
+                vsize: proc.virtual_memory() + children_virtual_memory,
                 llu_time: log_mtime,
                 max_used_gpu_memory: 0,
-                used_gpu_memory: 0,
+                used_gpu_memory: 0 + children_gpu_memory,
                 children: None,
                 epoch_start_time: proc.start_time(),
             }))
+    }
+
+    fn update_procs(&self, pids: Vec<u32>) {
+        let mut sysinfo = self
+            .sysinfo_system
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        *sysinfo = sysinfo::System::new_with_specifics(
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
+        );
+        drop(sysinfo);
+        info!("Updated procs info");
+
+        self.refresh_children_procs_cache(pids);
     }
 }
 
@@ -917,8 +999,9 @@ mod tests {
     mod tests {
         // ... existing imports ...
 
-        use std::collections::HashMap;
+        use std::{collections::HashMap, sync::Mutex};
 
+        use dashmap::DashMap;
         use itertools::Itertools;
         use opencue_proto::host::HardwareState;
         use uuid::Uuid;
@@ -1052,6 +1135,8 @@ mod tests {
                 },
                 hardware_state: HardwareState::Up,
                 attributes: HashMap::new(),
+                sysinfo_system: Mutex::new(sysinfo::System::new()),
+                children_procs_cache: DashMap::new(),
             }
         }
     }
