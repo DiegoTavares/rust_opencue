@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bytesize::KIB;
 use dashmap::DashMap;
 use opencue_proto::report::RunningFrameInfo;
 use uuid::Uuid;
@@ -42,15 +43,15 @@ impl RunningFrameCache {
                     layer_id: running_frame.request.layer_id.to_string(),
                     num_cores: running_frame.request.num_cores as i32,
                     start_time: frame_stats.epoch_start_time as i64,
-                    max_rss: frame_stats.max_rss as i64,
-                    rss: frame_stats.rss as i64,
-                    max_vsize: frame_stats.max_vsize as i64,
-                    vsize: frame_stats.vsize as i64,
+                    max_rss: (frame_stats.max_rss / KIB) as i64,
+                    rss: (frame_stats.rss / KIB) as i64,
+                    max_vsize: (frame_stats.max_vsize / KIB) as i64,
+                    vsize: (frame_stats.vsize / KIB) as i64,
                     attributes: running_frame.request.attributes.clone(),
                     llu_time: frame_stats.llu_time as i64,
                     num_gpus: running_frame.request.num_gpus as i32,
-                    max_used_gpu_memory: frame_stats.max_used_gpu_memory as i64,
-                    used_gpu_memory: frame_stats.used_gpu_memory as i64,
+                    max_used_gpu_memory: (frame_stats.max_used_gpu_memory / KIB) as i64,
+                    used_gpu_memory: (frame_stats.used_gpu_memory / KIB) as i64,
                     children: frame_stats.children.clone(),
                 }
             })

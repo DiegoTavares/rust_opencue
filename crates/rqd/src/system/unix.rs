@@ -16,7 +16,7 @@ use opencue_proto::host::HardwareState;
 use sysinfo::{
     DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::config::MachineConfig;
@@ -26,7 +26,7 @@ use super::machine::{
     SystemController,
 };
 
-pub struct LinuxSystem {
+pub struct UnixSystem {
     config: MachineConfig,
     /// Map of procids indexed by physid and coreid
     procid_by_physid_and_core_id: HashMap<u32, HashMap<u32, u32>>,
@@ -49,6 +49,7 @@ struct MemInfoData {
     free_swap: u64,
 }
 
+#[derive(Debug)]
 struct ProcessorInfoData {
     hyperthreading_multiplier: u32,
     num_procs: u32,
@@ -72,16 +73,17 @@ struct MachineStaticInfo {
 }
 
 pub struct MachineDynamicInfo {
-    pub free_memory: u64,
+    // Free + Cached
+    pub available_memory: u64,
     pub free_swap: u64,
     pub total_temp_storage: u64,
     pub free_temp_storage: u64,
     pub load: u32,
 }
 
-impl LinuxSystem {
-    /// Initialize the linux stats collector which reads Cpu and Memory information from
-    /// the Os.
+impl UnixSystem {
+    /// Initialize the unix sstats collector which reads Cpu and Memory information from
+    /// the OS.
     ///
     /// sysinfo needs to have been initialized.
     pub fn init(config: &MachineConfig) -> Result<Self> {
@@ -382,6 +384,7 @@ impl LinuxSystem {
         Ok(override_workstation_mode)
     }
 
+    #[cfg(target_os = "linux")]
     fn read_dynamic_stat(&self) -> Result<MachineDynamicInfo> {
         let config = &self.config;
         let load = Self::read_load_avg(&config.proc_loadavg_path)?;
@@ -391,7 +394,8 @@ impl LinuxSystem {
         );
 
         Ok(MachineDynamicInfo {
-            free_memory: sysinfo.free_memory(),
+            // TODO: Confirm available_memory is the best option for linux
+            available_memory: sysinfo.available_memory(),
             free_swap: sysinfo.free_swap(),
             total_temp_storage: total_space,
             free_temp_storage: available_space,
@@ -399,6 +403,25 @@ impl LinuxSystem {
         })
     }
 
+    #[cfg(target_os = "macos")]
+    fn read_dynamic_stat(&self) -> Result<MachineDynamicInfo> {
+        let config = &self.config;
+        let load = Self::read_load_avg(&config.proc_loadavg_path)?;
+        let (total_space, available_space) = self.read_temp_storage()?;
+        let sysinfo = sysinfo::System::new_with_specifics(
+            RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+        );
+
+        Ok(MachineDynamicInfo {
+            // sysinfo.available_memory() would be the best way to infer available memory, but it
+            // returns 0 on M macs
+            available_memory: sysinfo.total_memory() - sysinfo.used_memory(),
+            free_swap: sysinfo.free_swap(),
+            total_temp_storage: total_space,
+            free_temp_storage: available_space,
+            load: ((load.0 * 100.0).round() as u32 / self.static_info.hyperthreading_multiplier),
+        })
+    }
     /// Reads the load average from the specified `proc_loadavg_path` file and extracts
     /// the 1-minute, 5-minute and 15-minute load averages.
     ///
@@ -610,7 +633,7 @@ impl LinuxSystem {
     }
 }
 
-impl SystemController for LinuxSystem {
+impl SystemController for UnixSystem {
     fn collect_stats(&self) -> Result<MachineStat> {
         let dinamic_stat = self.read_dynamic_stat()?;
         Ok(MachineStat {
@@ -623,7 +646,7 @@ impl SystemController for LinuxSystem {
             hyperthreading_multiplier: self.static_info.hyperthreading_multiplier,
             boot_time: self.static_info.boot_time,
             tags: self.static_info.tags.clone(),
-            free_memory: dinamic_stat.free_memory,
+            available_memory: dinamic_stat.available_memory,
             free_swap: dinamic_stat.free_swap,
             total_temp_storage: dinamic_stat.total_temp_storage,
             free_temp_storage: dinamic_stat.free_temp_storage,
@@ -645,7 +668,7 @@ impl SystemController for LinuxSystem {
 
     fn init_nimby(&self) -> Result<bool> {
         // TODO: missing implementation, returning dummy val
-        Ok(true)
+        Ok(false)
     }
 
     fn collect_gpu_stats(&self) -> super::machine::MachineGpuStats {
@@ -829,7 +852,7 @@ impl SystemController for LinuxSystem {
 
 #[cfg(test)]
 mod tests {
-    use super::LinuxSystem;
+    use super::UnixSystem;
     use crate::config::config::MachineConfig;
     use std::fs;
 
@@ -846,7 +869,7 @@ mod tests {
         config.inittab_path = "".to_string();
         config.core_multiplier = 1;
 
-        let linux_monitor = LinuxSystem::init(&config)
+        let linux_monitor = UnixSystem::init(&config)
             .expect("Initializing LinuxMachineStat failed")
             .static_info;
         assert_eq!(4, linux_monitor.num_procs);
@@ -909,7 +932,7 @@ mod tests {
             };
 
             let (cpuinfo, procid_by_physid_and_core_id, physid_and_coreid_by_procid) =
-                LinuxSystem::read_cpuinfo(&file_path).expect("Failed to read file");
+                UnixSystem::read_cpuinfo(&file_path).expect("Failed to read file");
             // Assert that the mapping between processor ID, physical ID, and core ID is correct
             let mut found_mapping = false;
             println!(
@@ -964,7 +987,7 @@ mod tests {
         config.inittab_path = "".to_string();
         config.core_multiplier = 1;
 
-        let stat = LinuxSystem::init(&config).expect("Initializing LinuxMachineStat failed");
+        let stat = UnixSystem::init(&config).expect("Initializing LinuxMachineStat failed");
         let static_info = stat.static_info;
 
         // Proc
@@ -1002,7 +1025,7 @@ mod tests {
         let project_dir = env!("CARGO_MANIFEST_DIR");
 
         let path = format!("{}/resources/distro-release/{}", project_dir, id);
-        let release = LinuxSystem::read_distro(&path).expect("Failed to read release");
+        let release = UnixSystem::read_distro(&path).expect("Failed to read release");
 
         assert_eq!(id.to_string(), release);
     }
@@ -1012,7 +1035,7 @@ mod tests {
         let project_dir = env!("CARGO_MANIFEST_DIR");
 
         let path = format!("{}/resources/proc/stat", project_dir);
-        let boot_time = LinuxSystem::read_boot_time(&path).expect("Failed to read boot time");
+        let boot_time = UnixSystem::read_boot_time(&path).expect("Failed to read boot time");
         assert_eq!(1720194269, boot_time);
     }
 
@@ -1024,23 +1047,23 @@ mod tests {
         // Test successful case
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "1.00 2.00 3.00 4/512 12345").unwrap();
-        let result = LinuxSystem::read_load_avg(temp_file.path().to_str().unwrap());
+        let result = UnixSystem::read_load_avg(temp_file.path().to_str().unwrap());
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), (1.0, 2.0, 3.0));
 
         // Test empty file
         let empty_file = NamedTempFile::new().unwrap();
-        let result = LinuxSystem::read_load_avg(empty_file.path().to_str().unwrap());
+        let result = UnixSystem::read_load_avg(empty_file.path().to_str().unwrap());
         assert!(result.is_err());
 
         // Test invalid format
         let mut invalid_file = NamedTempFile::new().unwrap();
         writeln!(invalid_file, "invalid format").unwrap();
-        let result = LinuxSystem::read_load_avg(invalid_file.path().to_str().unwrap());
+        let result = UnixSystem::read_load_avg(invalid_file.path().to_str().unwrap());
         assert!(result.is_err());
 
         // Test non-existent file
-        let result = LinuxSystem::read_load_avg("nonexistent_file");
+        let result = UnixSystem::read_load_avg("nonexistent_file");
         assert!(result.is_err());
     }
 
@@ -1058,8 +1081,8 @@ mod tests {
         use crate::{
             config::config::MachineConfig,
             system::{
-                linux::{LinuxSystem, MachineStaticInfo},
                 machine::{CpuStat, ReservationError, SystemController},
+                unix::{MachineStaticInfo, UnixSystem},
             },
         };
 
@@ -1147,7 +1170,7 @@ mod tests {
         }
 
         // Helper function to create a test system with specified configuration
-        fn setup_test_system(total_cores: u32, physical_cpus: u32) -> LinuxSystem {
+        fn setup_test_system(total_cores: u32, physical_cpus: u32) -> UnixSystem {
             let mut procid_by_physid_and_core_id = HashMap::new();
             let mut physid_and_coreid_by_procid = HashMap::new();
 
@@ -1163,7 +1186,7 @@ mod tests {
                 procid_by_physid_and_core_id.insert(phys_id, core_map);
             }
 
-            LinuxSystem {
+            UnixSystem {
                 config: MachineConfig::default(),
                 procid_by_physid_and_core_id,
                 physid_and_coreid_by_procid,

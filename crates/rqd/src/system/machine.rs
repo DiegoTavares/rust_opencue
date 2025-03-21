@@ -5,7 +5,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use miette::{Diagnostic, IntoDiagnostic, Result};
+use bytesize::KIB;
+use miette::{Diagnostic, IntoDiagnostic, Result, miette};
 use opencue_proto::{
     host::HardwareState,
     report::{ChildrenProcStats, CoreDetail, RenderHost},
@@ -29,7 +30,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::linux::LinuxSystem;
+use super::unix::UnixSystem;
 
 type SystemControllerType = Box<dyn SystemController + Sync + Send>;
 
@@ -56,7 +57,7 @@ pub struct MachineMonitor {
     report_client: Arc<ReportClient>,
     pub system_controller: Mutex<SystemControllerType>,
     pub running_frames_cache: Arc<RunningFrameCache>,
-    core_state: Arc<Mutex<Option<CoreDetail>>>,
+    core_state: Arc<Mutex<CoreDetail>>,
     last_host_state: Arc<Mutex<Option<RenderHost>>>,
     interrupt: Mutex<Option<Sender<()>>>,
 }
@@ -69,14 +70,14 @@ impl MachineMonitor {
         report_client: Arc<ReportClient>,
         running_frames_cache: Arc<RunningFrameCache>,
     ) -> Result<Self> {
-        let system_controller: SystemControllerType = Box::new(LinuxSystem::init(&config.machine)?);
+        let system_controller: SystemControllerType = Box::new(UnixSystem::init(&config.machine)?);
         // TODO: identify which OS is running and initialize stats_collector accordingly
         Ok(Self {
             maching_config: config.machine.clone(),
             report_client,
             system_controller: Mutex::new(system_controller),
             running_frames_cache,
-            core_state: Arc::new(Mutex::new(None)),
+            core_state: Arc::new(Mutex::new(CoreDetail::default())),
             last_host_state: Arc::new(Mutex::new(None)),
             interrupt: Mutex::new(None),
         })
@@ -104,10 +105,8 @@ impl MachineMonitor {
         };
         {
             // Setup initial state
-            self.core_state
-                .lock()
-                .await
-                .replace(initial_core_state.clone());
+            let mut core_state_lock = self.core_state.lock().await;
+            *core_state_lock = initial_core_state.clone();
         }
         debug!("Sending start report: {:?}", host_state);
         report_client
@@ -170,11 +169,7 @@ impl MachineMonitor {
         self_host_state_lock.replace(host_state.clone());
         drop(self_host_state_lock);
 
-        let core_state_guard = self.core_state.lock().await;
-        let core_state = core_state_guard
-            .as_ref()
-            .expect("A state must be set at this point");
-
+        let core_state = { self.core_state.lock().await.clone() };
         self.monitor_running_frames().await?;
 
         debug!("Sending host report: {:?}", host_state);
@@ -182,7 +177,7 @@ impl MachineMonitor {
             .send_host_report(
                 host_state,
                 Arc::clone(&self.running_frames_cache).into_running_frame_vec(),
-                core_state.clone(),
+                core_state,
             )
             .await?;
         Ok(())
@@ -245,6 +240,17 @@ impl MachineMonitor {
                         None => 0,
                     };
 
+                    // Release resources
+                    if let Some(procs) = &frame.cpu_list {
+                        self.release_cpus(procs).await;
+                    } else {
+                        self.release_cores(
+                            frame.request.num_cores as u32 / self.maching_config.core_multiplier,
+                        )
+                        .await;
+                    }
+
+                    // Send complete report
                     if let Err(err) = self
                         .report_client
                         .send_frame_complete_report(
@@ -281,13 +287,13 @@ impl MachineMonitor {
             nimby_locked: false, // TODO: implement nimby lock
             facility: config.facility.clone(),
             num_procs: stats.num_procs as i32,
-            cores_per_proc: (stats.num_sockets / stats.cores_per_proc) as i32,
-            total_swap: stats.total_swap as i64,
-            total_mem: stats.total_memory as i64,
-            total_mcp: stats.total_temp_storage as i64,
-            free_swap: stats.free_swap as i64,
-            free_mem: stats.free_memory as i64,
-            free_mcp: stats.free_temp_storage as i64,
+            cores_per_proc: (stats.cores_per_proc * config.core_multiplier) as i32,
+            total_swap: (stats.total_swap / KIB) as i64,
+            total_mem: (stats.total_memory / KIB) as i64,
+            total_mcp: (stats.total_temp_storage / KIB) as i64,
+            free_swap: (stats.free_swap / KIB) as i64,
+            free_mem: (stats.available_memory / KIB) as i64,
+            free_mcp: (stats.free_temp_storage / KIB) as i64,
             load: stats.load as i32,
             boot_time: stats.boot_time as i32,
             tags: stats.tags,
@@ -310,17 +316,47 @@ pub trait Machine {
     /// # Argument
     ///
     /// * `num_cores` - The number of cores to reserve
+    /// * `resource_id` - Id of the resource to be associated to the reservation
+    /// * `with_affinity` - If true, use `taskset` to attempt to reserve cores that
+    ///    might share the same cache
     ///
     /// # Returns
     ///
     /// List of procs (Argument called cpu-list in the unix taskset cmd) reserved
     /// by this request
-    async fn reserve_cores(&self, num_cores: u32, resource_id: Uuid) -> Result<Vec<u32>>;
+    async fn reserve_cores(
+        &self,
+        num_cores: u32,
+        resource_id: Uuid,
+        with_affinity: bool,
+    ) -> Result<Option<Vec<u32>>>;
 
+    /// Reserve specific CPU cores by their IDs
+    ///
+    /// # Arguments
+    ///
+    /// * `cpu_list` - Vector of CPU core IDs to reserve
+    /// * `resource_id` - Unique identifier for the resource that will use these cores
+    ///
+    /// # Returns
+    ///
+    /// Vector of successfully reserved CPU core IDs
     async fn reserve_cores_by_id(&self, cpu_list: &Vec<u32>, resource_id: Uuid)
     -> Result<Vec<u32>>;
 
+    /// Release specific CPU cores by their IDs
+    ///
+    /// # Arguments
+    ///
+    /// * `procs` - Vector of CPU core IDs to release
     async fn release_cpus(&self, procs: &Vec<u32>);
+
+    /// Releases a specified number of CPU cores
+    ///
+    /// # Arguments
+    ///
+    /// * `num_cores` - The number of cores to release
+    async fn release_cores(&self, num_cores: u32);
 
     /// Reserve GPU units
     ///
@@ -333,6 +369,17 @@ pub trait Machine {
     /// List of gpu units
     async fn reserve_gpus(&self, num_gpus: u32) -> Result<Vec<u32>>;
 
+    /// Creates a user account if it doesn't already exist in the system
+    ///
+    /// # Arguments
+    ///
+    /// * `username` - The name of the user to create
+    /// * `uid` - The user ID to assign to the new user
+    /// * `gid` - The group ID to assign to the new user
+    ///
+    /// # Returns
+    ///
+    /// The user ID (uid) of the created or existing user
     async fn create_user_if_unexisting(&self, username: &str, uid: u32, gid: u32) -> Result<u32>;
 
     async fn get_host_name(&self) -> String;
@@ -357,11 +404,33 @@ impl Machine for MachineMonitor {
             .unwrap_or(false)
     }
 
-    async fn reserve_cores(&self, num_cores: u32, resource_id: Uuid) -> Result<Vec<u32>> {
-        let mut stats_collector = self.system_controller.lock().await;
-        stats_collector
-            .reserve_cores(num_cores, resource_id)
-            .into_diagnostic()
+    async fn reserve_cores(
+        &self,
+        num_cores: u32,
+        resource_id: Uuid,
+        with_affinity: bool,
+    ) -> Result<Option<Vec<u32>>> {
+        // Reserve cores on the socket level
+        let cores_result = if with_affinity {
+            let mut stats_collector = self.system_controller.lock().await;
+            stats_collector
+                .reserve_cores(num_cores, resource_id)
+                .into_diagnostic()
+                .map(|v| Some(v))
+        } else {
+            Ok(None)
+        };
+
+        // Record reservation to be reported to cuebot
+        if let Ok(_) = &cores_result {
+            let mut core_state = self.core_state.lock().await;
+            info!("Before: {:?}", *core_state);
+            core_state
+                .reserve(num_cores * self.maching_config.core_multiplier)
+                .map_err(|err| miette!(err))?;
+            info!("After: {:?}", *core_state);
+        }
+        cores_result
     }
 
     async fn reserve_cores_by_id(
@@ -369,26 +438,65 @@ impl Machine for MachineMonitor {
         cpu_list: &Vec<u32>,
         resource_id: Uuid,
     ) -> Result<Vec<u32>> {
-        let mut stats_collector = self.system_controller.lock().await;
-        stats_collector
-            .reserve_cores_by_id(cpu_list, resource_id)
-            .into_diagnostic()
+        // Reserve cores on the socket level
+        let cores_result = {
+            let mut stats_collector = self.system_controller.lock().await;
+            stats_collector
+                .reserve_cores_by_id(cpu_list, resource_id)
+                .into_diagnostic()
+        };
+
+        // Record reservation to be reported to cuebot
+        if let Ok(_) = &cores_result {
+            let mut core_state = self.core_state.lock().await;
+            core_state
+                .reserve(cpu_list.len() as u32 * self.maching_config.core_multiplier)
+                .map_err(|err| miette!(err))?;
+        }
+        cores_result
     }
 
     async fn release_cpus(&self, procs: &Vec<u32>) {
-        let mut stats_collector = self.system_controller.lock().await;
-        for core_id in procs {
-            if let Err(err) = stats_collector.release_core(core_id) {
-                match err {
-                    ReservationError::NotFoundError(_) => {
-                        warn!("Failed to release proc {core_id}. Reservation not found")
-                    }
-                    _ => {
-                        error!("Failed to release proc {core_id}. Unexpected error")
+        {
+            let mut stats_collector = self.system_controller.lock().await;
+            for core_id in procs {
+                if let Err(err) = stats_collector.release_core(core_id) {
+                    match err {
+                        ReservationError::NotFoundError(_) => {
+                            warn!("Failed to release proc {core_id}. Reservation not found")
+                        }
+                        _ => {
+                            error!("Failed to release proc {core_id}. Unexpected error")
+                        }
                     }
                 }
             }
         }
+        // Record reservation to be reported to cuebot
+        let mut core_state = self.core_state.lock().await;
+        if let Err(err) = core_state
+            .release(procs.len() as u32 * self.maching_config.core_multiplier)
+            .map_err(|err| miette!(err))
+        {
+            error!(
+                "Accountability error. Failed to release the requested number of cores. {}",
+                err
+            )
+        };
+    }
+
+    async fn release_cores(&self, num_cores: u32) {
+        // Record reservation to be reported to cuebot
+        let mut core_state = self.core_state.lock().await;
+        if let Err(err) = core_state
+            .release(num_cores as u32 * self.maching_config.core_multiplier)
+            .map_err(|err| miette!(err))
+        {
+            error!(
+                "Accountability error. Failed to release the requested number of cores. {}",
+                err
+            )
+        };
     }
 
     async fn reserve_gpus(&self, num_gpus: u32) -> Result<Vec<u32>> {
@@ -411,7 +519,7 @@ impl Machine for MachineMonitor {
 
 /// Represents attributes on a machine that should never change withour restarting the
 /// entire servive
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MachineStat {
     /// Machine name
     pub hostname: String,
@@ -431,8 +539,8 @@ pub struct MachineStat {
     pub boot_time: u32,
     /// List of tags associated with this machine
     pub tags: Vec<String>,
-    /// Amount of free memory on the machine
-    pub free_memory: u64,
+    /// Amount of available memory on the machine. For Linux/Macos Free + Cached
+    pub available_memory: u64,
     /// Amount of free swap space on the machine
     pub free_swap: u64,
     /// Total temporary storage available on the machine

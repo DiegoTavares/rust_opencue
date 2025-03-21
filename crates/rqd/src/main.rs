@@ -56,7 +56,7 @@ async fn main() -> miette::Result<()> {
 
     // Initialize frame manager
     let frame_manager = Arc::new(FrameManager {
-        config: config.runner.clone(),
+        config: config.clone(),
         frame_cache: Arc::clone(&running_frame_cache),
         machine: mm_clone.clone(),
     });
