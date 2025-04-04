@@ -59,6 +59,12 @@ impl WithUuid for report::RunningFrameInfo {
     }
 }
 
+impl WithUuid for rqd::RqdStaticGetRunningFrameStatusRequest {
+    fn uuid(&self) -> Uuid {
+        to_uuid(&self.frame_id).unwrap_or(Uuid::nil())
+    }
+}
+
 pub fn to_uuid(stringified_id_from_protobuf: &str) -> Option<Uuid> {
     Uuid::parse_str(stringified_id_from_protobuf).ok()
 }
@@ -98,13 +104,13 @@ impl fmt::Display for Host {
 
 impl CoreDetail {
     /// Update CoreDetail by reserving a number of cores
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `core_count_with_multiplier` - The number of cores to reserve
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// * `Ok(())` if cores were reserved successfully
     /// * `Err(String)` if trying to reserve more cores than are available
     pub fn reserve(&mut self, core_count_with_multiplier: u32) -> Result<(), String> {
@@ -121,13 +127,13 @@ impl CoreDetail {
     }
 
     /// Update CoreDetail by releasing a number of previously reserved cores
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `core_count_with_multiplier` - The number of cores to release
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// * `Ok(())` if cores were released successfully
     /// * `Err(String)` if trying to release more cores than are currently reserved
     pub fn release(&mut self, core_count_with_multiplier: u32) -> Result<(), String> {
