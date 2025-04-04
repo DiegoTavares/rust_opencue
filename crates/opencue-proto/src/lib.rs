@@ -98,13 +98,13 @@ impl fmt::Display for Host {
 
 impl CoreDetail {
     /// Update CoreDetail by reserving a number of cores
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `core_count_with_multiplier` - The number of cores to reserve
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// * `Ok(())` if cores were reserved successfully
     /// * `Err(String)` if trying to reserve more cores than are available
     pub fn reserve(&mut self, core_count_with_multiplier: u32) -> Result<(), String> {
@@ -121,20 +121,20 @@ impl CoreDetail {
     }
 
     /// Update CoreDetail by releasing a number of previously reserved cores
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `core_count_with_multiplier` - The number of cores to release
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// * `Ok(())` if cores were released successfully
     /// * `Err(String)` if trying to release more cores than are currently reserved
     pub fn release(&mut self, core_count_with_multiplier: u32) -> Result<(), String> {
         if self.booked_cores < core_count_with_multiplier as i32 {
             Err(format!(
                 "Tried to release {} out of {} cores reserved",
-                core_count_with_multiplier, self.idle_cores,
+                core_count_with_multiplier, self.booked_cores,
             ))
         } else {
             self.idle_cores += core_count_with_multiplier as i32;
