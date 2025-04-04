@@ -140,7 +140,7 @@ impl CoreDetail {
         if self.booked_cores < core_count_with_multiplier as i32 {
             Err(format!(
                 "Tried to release {} out of {} cores reserved",
-                core_count_with_multiplier, self.idle_cores,
+                core_count_with_multiplier, self.booked_cores,
             ))
         } else {
             self.idle_cores += core_count_with_multiplier as i32;

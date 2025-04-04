@@ -114,6 +114,12 @@ impl Display for RunningFrame {
     }
 }
 
+impl Into<RunningFrameInfo> for RunningFrame {
+    fn into(self) -> RunningFrameInfo {
+        todo!()
+    }
+}
+
 impl RunningFrame {
     pub fn init(
         request: RunFrame,
