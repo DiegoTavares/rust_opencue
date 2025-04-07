@@ -68,9 +68,9 @@ impl RqdInterface for RqdServant {
             .frame_cache
             .get(&frame_id)
             .map(|frame| frame.into_running_frame_info())
-            .ok_or(tonic::Status::not_found(
-                "Could not find frame with id {frame_id}",
-            ))?;
+            .ok_or(tonic::Status::not_found(format!(
+                "Could not find frame with id {frame_id}"
+            )))?;
 
         Ok(Response::new(RqdStaticGetRunningFrameStatusResponse {
             running_frame_info: running_frame,
