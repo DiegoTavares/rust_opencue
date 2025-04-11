@@ -1,45 +1,63 @@
-use std::{collections::HashMap, os::unix::process::CommandExt, process::Command};
-
-use itertools::Itertools;
+use miette::{IntoDiagnostic, Result, miette};
+use std::io::Write;
+use std::process::Command;
+use std::{fs, fs::File};
 
 pub struct FrameCmdBuilder {
     cmd: Command,
-    exit_file: Option<String>,
+    shell: String,
+    exit_file_path: Option<String>,
+    entrypoint_file_path: String,
+    end_cmd: Option<String>,
 }
 
 impl FrameCmdBuilder {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub fn new(shell: &String) -> Self {
-        let mut cmd = Command::new(shell);
-        cmd.arg("-c");
+    pub fn new(shell: &String, entrypoint_file_path: String) -> Self {
+        let cmd = Command::new(shell);
         Self {
             cmd,
-            exit_file: None,
+            shell: shell.clone(),
+            exit_file_path: None,
+            entrypoint_file_path,
+            end_cmd: None,
         }
     }
 
-    pub fn build(&mut self) -> &mut Command {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn build(&mut self) -> Result<(&mut Command, String)> {
+        use std::os::unix::fs::PermissionsExt;
+
         let args: Vec<&str> = self.cmd.get_args().filter_map(|arg| arg.to_str()).collect();
-        let cmd_str = args[1..].join(" ");
+        let cmd_str = args.join(" ");
+        let mut file = File::create(&self.entrypoint_file_path).into_diagnostic()?;
 
-        // Reset cmd to rewrite it properly.
-        // self.cmd.arg(val) is used until this point loosely to collect argument without taking into
-        // consideration that `-c` expects a single argument. The folowing logic recreates the command
-        // unifying everything after -c.
-        self.cmd = Command::new(self.cmd.get_program());
-        self.cmd.arg("-c");
+        let script = format!(
+            "#!{}\n\
+            source \"{}\"\n\
+            exit_code=$?\n\
+            {}\n\
+            exit $exit_code\n",
+            self.shell,
+            cmd_str,
+            if let Some(exit_file) = &self.exit_file_path {
+                format!("echo $exit_code > {}\n", exit_file)
+            } else {
+                String::new()
+            }
+        );
+        self.end_cmd = Some(script.clone());
 
-        if let Some(exit_file) = &self.exit_file {
-            let full_command = format!(
-                "{}; code=$?; echo $code > {}; exit $code",
-                cmd_str, exit_file,
-            );
-            self.cmd.arg(full_command);
-        } else {
-            self.cmd.arg(cmd_str);
-        }
+        file.write_all(script.as_bytes()).into_diagnostic()?;
+        // Make the entrypoint file executable
+        fs::set_permissions(
+            &self.entrypoint_file_path,
+            fs::Permissions::from_mode(0o755),
+        )
+        .map_err(|e| miette!("Failed to set entrypoint file permissions: {}", e))?;
 
-        &mut self.cmd
+        self.cmd = Command::new(&self.entrypoint_file_path);
+        Ok((&mut self.cmd, script.clone()))
     }
 
     /// Adds a taskset reservation for the `proc_list`:
@@ -97,7 +115,7 @@ impl FrameCmdBuilder {
     }
 
     pub fn with_exit_file(&mut self, exit_file_path: String) -> &mut Self {
-        self.exit_file = Some(exit_file_path);
+        self.exit_file_path = Some(exit_file_path);
         self
     }
 }

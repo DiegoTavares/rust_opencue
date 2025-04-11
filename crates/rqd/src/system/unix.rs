@@ -12,18 +12,19 @@ use std::{
 use dashmap::DashMap;
 use itertools::Itertools;
 use miette::{IntoDiagnostic, Result, miette};
+use nix::sys::signal::{Signal, kill};
 use opencue_proto::host::HardwareState;
 use sysinfo::{
     DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::config::config::MachineConfig;
 
-use super::machine::{
+use super::manager::{
     CoreReservation, CpuStat, MachineGpuStats, MachineStat, ProcessStats, ReservationError,
-    SystemController,
+    SystemManager,
 };
 
 pub struct UnixSystem {
@@ -38,8 +39,10 @@ pub struct UnixSystem {
     hardware_state: HardwareState,
     attributes: HashMap<String, String>,
     sysinfo_system: Mutex<sysinfo::System>,
-    // Stores a cache of each monitored process' list of children processes
-    children_procs_cache: DashMap<u32, Vec<u32>>,
+    // Cache of all processes and their children
+    procs_children_cache: DashMap<u32, Vec<u32>>,
+    // Cache of monitored processes and their lineage
+    procs_lineage_cache: DashMap<u32, Vec<u32>>,
 }
 
 #[derive(Debug)]
@@ -134,7 +137,8 @@ impl UnixSystem {
                 available_cores: available_core_count,
             },
             sysinfo_system: Mutex::new(sysinfo::System::new()),
-            children_procs_cache: DashMap::new(),
+            procs_children_cache: DashMap::new(),
+            procs_lineage_cache: DashMap::new(),
         })
     }
 
@@ -534,22 +538,34 @@ impl UnixSystem {
     /// This method relies on sysinfo to have been updated periodically
     /// throught the read_dynamic_stat method to gather the updated list
     /// of running processes
-    fn refresh_children_procs_cache(&self, pids: Vec<u32>) {
+    fn refresh_procs_cache(&self) {
         let sysinfo = self
             .sysinfo_system
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         // Clear up cache
-        self.children_procs_cache.clear();
+        self.procs_children_cache.clear();
 
+        // Collect all procs and its direct children
         for (parent_pid, children_pid) in sysinfo.processes().iter().map(|(children_pid, proc)| {
             let parent_pid = proc.parent().unwrap_or(Pid::from_u32(0)).as_u32();
             (parent_pid, children_pid.clone())
         }) {
-            self.children_procs_cache
+            self.procs_children_cache
                 .entry(parent_pid)
                 .and_modify(|children| children.push(children_pid.as_u32()))
                 .or_insert(vec![children_pid.as_u32()]);
+        }
+
+        // Clear procs that have finished from lineage cache
+        let procs_to_clear: Vec<u32> = self
+            .procs_lineage_cache
+            .iter()
+            .filter(|item| !self.procs_children_cache.contains_key(item.key()))
+            .map(|item| item.key().clone())
+            .collect();
+        for pid in procs_to_clear {
+            self.procs_lineage_cache.remove(&pid);
         }
     }
 
@@ -581,7 +597,7 @@ impl UnixSystem {
         mut cycle_trace: Vec<u32>,
     ) -> (u64, u64, u64, MutexGuard<'a, System>, Vec<u32>) {
         match sysinfo.process(Pid::from(pid.clone() as usize)) {
-            Some(proc) => match self.children_procs_cache.get(pid) {
+            Some(proc) => match self.procs_children_cache.get(pid) {
                 Some(children_pids) => {
                     cycle_trace.push(pid.clone());
                     let (mut sum_memory, mut sum_virtual_memory, mut sum_gpu_memory) =
@@ -626,7 +642,7 @@ impl UnixSystem {
     }
 }
 
-impl SystemController for UnixSystem {
+impl SystemManager for UnixSystem {
     fn collect_stats(&self) -> Result<MachineStat> {
         let dinamic_stat = self.read_dynamic_stat()?;
         Ok(MachineStat {
@@ -664,7 +680,7 @@ impl SystemController for UnixSystem {
         Ok(false)
     }
 
-    fn collect_gpu_stats(&self) -> super::machine::MachineGpuStats {
+    fn collect_gpu_stats(&self) -> MachineGpuStats {
         // TODO: missing implementation, returning dummy val
         MachineGpuStats {
             count: 0,
@@ -674,7 +690,7 @@ impl SystemController for UnixSystem {
         }
     }
 
-    fn cpu_stat(&self) -> super::machine::CpuStat {
+    fn cpu_stat(&self) -> CpuStat {
         self.cpu_stat.clone()
     }
 
@@ -803,7 +819,7 @@ impl SystemController for UnixSystem {
             .sysinfo_system
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        let (summed_memory, summed_virtual_memory, summed_gpu_memory, guard, _) =
+        let (summed_memory, summed_virtual_memory, summed_gpu_memory, guard, lineage) =
             self.calculate_children_memory(&pid, sysinfo, Vec::new());
         debug!(
             "Collect frame stats fo {}. rss: {}mb virtual: {}mb gpu: {}mb",
@@ -812,6 +828,8 @@ impl SystemController for UnixSystem {
             summed_virtual_memory / 1024 / 1024,
             summed_gpu_memory / 1024 / 1024
         );
+
+        self.procs_lineage_cache.insert(pid, lineage);
 
         Ok(guard
             .process(Pid::from(pid as usize))
@@ -829,7 +847,7 @@ impl SystemController for UnixSystem {
             }))
     }
 
-    fn update_procs(&self, pids: Vec<u32>) {
+    fn refresh_procs(&self, pids: Vec<u32>) {
         let mut sysinfo = self
             .sysinfo_system
             .lock()
@@ -839,7 +857,33 @@ impl SystemController for UnixSystem {
             RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
         );
         drop(sysinfo);
-        self.refresh_children_procs_cache(pids);
+        self.refresh_procs_cache();
+    }
+
+    fn kill(&self, pid: u32) -> Result<()> {
+        kill(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGTERM)
+            .map_err(|err| miette!("Failed to kill {pid}. {err}"))
+    }
+
+    fn force_kill(&self, pids: &Vec<u32>) -> Result<()> {
+        let mut failed_pids = Vec::new();
+        let mut last_err = Ok(());
+        for pid in pids {
+            if let Err(err) = kill(
+                nix::unistd::Pid::from_raw(pid.clone() as i32),
+                Signal::SIGKILL,
+            ) {
+                failed_pids.push(pid);
+                last_err = Err(err);
+            }
+        }
+        last_err.map_err(|err| miette!("Failed to force kill pids {:?}. Errno={err}", failed_pids))
+    }
+
+    fn get_proc_lineage(&self, pid: u32) -> Option<Vec<u32>> {
+        self.procs_lineage_cache
+            .get(&pid)
+            .map(|lineage| lineage.clone())
     }
 }
 
@@ -1074,7 +1118,7 @@ mod tests {
         use crate::{
             config::config::MachineConfig,
             system::{
-                machine::{CpuStat, ReservationError, SystemController},
+                manager::{CpuStat, ReservationError, SystemManager},
                 unix::{MachineStaticInfo, UnixSystem},
             },
         };
@@ -1201,7 +1245,8 @@ mod tests {
                 hardware_state: HardwareState::Up,
                 attributes: HashMap::new(),
                 sysinfo_system: Mutex::new(sysinfo::System::new()),
-                children_procs_cache: DashMap::new(),
+                procs_children_cache: DashMap::new(),
+                procs_lineage_cache: DashMap::new(),
             }
         }
     }

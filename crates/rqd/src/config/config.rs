@@ -2,7 +2,7 @@ use crate::config::error::RqdConfigError;
 use bytesize::ByteSize;
 use config::{Config as ConfigBase, Environment, File};
 use serde::{Deserialize, Serialize};
-use std::{env, fs, path::Path, sync::Arc};
+use std::{env, fs, path::Path, time::Duration};
 
 static DEFAULT_CONFIG_FILE: &str = "~/.local/share/rqd.yaml";
 
@@ -48,7 +48,8 @@ impl Default for GrpcConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct MachineConfig {
-    pub monitor_interval_seconds: u64,
+    #[serde(with = "humantime_serde")]
+    pub monitor_interval: Duration,
     pub use_ip_as_hostname: bool,
     pub override_real_values: Option<OverrideConfig>,
     pub custom_tags: Vec<String>,
@@ -66,7 +67,7 @@ pub struct MachineConfig {
 impl Default for MachineConfig {
     fn default() -> MachineConfig {
         MachineConfig {
-            monitor_interval_seconds: 3,
+            monitor_interval: Duration::from_secs(3),
             use_ip_as_hostname: false,
             override_real_values: None,
             custom_tags: vec![],
@@ -97,6 +98,11 @@ pub struct RunnerConfig {
     pub temp_path: String,
     pub shell_path: String,
     pub snapshots_path: String,
+    #[serde(with = "humantime_serde")]
+    pub kill_monitor_interval: Duration,
+    #[serde(with = "humantime_serde")]
+    pub kill_monitor_timeout: Duration,
+    pub force_kill_after_timeout: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -123,6 +129,9 @@ impl Default for RunnerConfig {
                 "{}/.rqd/snapshots",
                 std::env::var("HOME").unwrap_or("/tmp".to_string())
             ),
+            kill_monitor_interval: Duration::from_secs(120),
+            kill_monitor_timeout: Duration::from_secs(1200),
+            force_kill_after_timeout: false,
         }
     }
 }
@@ -149,18 +158,6 @@ impl Default for OverrideConfig {
             os: None,
         }
     }
-}
-
-//===Config Traits===
-
-/// Defines a type that can be constructed using the configuration values
-pub trait FromConfig: Sized {
-    fn from_config(config: &Config) -> Result<Self, RqdConfigError>;
-}
-
-/// Defines a type that can be constructed using the configuration values
-pub trait FromConfigArc: Sized {
-    fn from_config(config: &Config) -> Result<Arc<Self>, RqdConfigError>;
 }
 
 //===Config Loader===
@@ -194,15 +191,15 @@ impl Config {
             .build()
             .map_err(|err| {
                 RqdConfigError::LoadConfigError(format!(
-                    "{:?} config could not be loaded",
-                    &config_file
+                    "{:?} config could not be loaded. {}",
+                    &config_file, err
                 ))
             })?;
 
         let deserialized_config = Config::deserialize(config).map_err(|err| {
             RqdConfigError::LoadConfigError(format!(
-                "{:?} config could not be deserialized",
-                &config_file
+                "{:?} config could not be deserialized. {}",
+                &config_file, err
             ))
         })?;
 
@@ -211,6 +208,7 @@ impl Config {
         Ok(deserialized_config)
     }
 
+    #[allow(dead_code)]
     pub fn load_file_and_env<P: AsRef<str>>(path: P) -> Result<Self, RqdConfigError> {
         let config = ConfigBase::builder()
             .add_source(File::with_name(path.as_ref()))
@@ -221,11 +219,14 @@ impl Config {
             .map(|c| Config::deserialize(c).unwrap())
             .map_err(|err| {
                 RqdConfigError::LoadConfigError(format!(
-                    "{:?} config could not be loaded",
-                    path.as_ref()
+                    "{:?} config could not be loaded. {}",
+                    path.as_ref(),
+                    err
                 ))
             })
     }
+
+    #[allow(dead_code)]
     pub fn load_file<P: AsRef<str>>(path: P) -> Result<Self, RqdConfigError> {
         let config = ConfigBase::builder()
             .add_source(File::with_name(path.as_ref()))
@@ -235,8 +236,9 @@ impl Config {
             .map(|c| Config::deserialize(c).unwrap())
             .map_err(|err| {
                 RqdConfigError::LoadConfigError(format!(
-                    "{:?} config could not be loaded",
-                    path.as_ref()
+                    "{:?} config could not be loaded. {}",
+                    path.as_ref(),
+                    err
                 ))
             })
     }
