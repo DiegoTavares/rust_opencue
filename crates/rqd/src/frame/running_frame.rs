@@ -373,7 +373,6 @@ impl RunningFrame {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn run_inner(&self, logger: FrameLogger) -> Result<(i32, Option<i32>)> {
-        use itertools::Itertools;
         use nix::libc;
         use tracing::trace;
 
