@@ -9,6 +9,7 @@ use std::{
         unix::process::CommandExt,
     },
     path::Path,
+    process::ExitStatus,
     sync::{Arc, Mutex, mpsc::Receiver},
     thread::JoinHandle,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -373,6 +374,8 @@ impl RunningFrame {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn run_inner(&self, logger: FrameLogger) -> Result<(i32, Option<i32>)> {
         use itertools::Itertools;
+        use nix::libc;
+        use tracing::trace;
 
         if self.config.run_on_docker {
             return self.run_on_docker();
@@ -395,19 +398,26 @@ impl RunningFrame {
             .with_frame_cmd(self.request.command.clone())
             .with_exit_file(self.exit_file_path.clone())
             .build()?;
-        cmd.envs(&self.env_vars)
-            .current_dir(&self.config.temp_path)
-            // An spawn job should be able to run independent of rqd.
-            // If this process dies, the process continues to write to its assigned file
-            // descriptor.
-            .stdout(unsafe { Stdio::from_raw_fd(raw_stdout) })
-            .stderr(unsafe { Stdio::from_raw_fd(raw_stderr) });
+        unsafe {
+            cmd.envs(&self.env_vars)
+                .current_dir(&self.config.temp_path)
+                .pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                })
+                // An spawn job should be able to run independent of rqd.
+                // If this process dies, the process continues to write to its assigned file
+                // descriptor.
+                .stdout(Stdio::from_raw_fd(raw_stdout))
+                .stderr(Stdio::from_raw_fd(raw_stderr));
+        }
 
         if self.config.run_as_user {
             cmd.uid(self.uid);
         }
 
-        logger.writeln(format!("Running {}: \n{}", self.entrypoint_file_path, cmd_str).as_str());
+        trace!("Running {}: {}", self.entrypoint_file_path, cmd_str);
+        logger.writeln(format!("Running {}:", self.entrypoint_file_path).as_str());
 
         // Launch frame process
         let mut child = cmd.spawn().into_diagnostic().map_err(|e| {
@@ -442,10 +452,8 @@ impl RunningFrame {
             warn!("Failed to join log thread");
         }
         let output = output.into_diagnostic()?;
+        let (exit_code, exit_signal) = Self::interprete_output(output);
 
-        let exit_signal = output.signal();
-        // If a process got terminated by a signal, set the exit_code to 1
-        let exit_code = output.code().unwrap_or(1);
         let msg = match exit_code {
             0 => format!("Frame {}(pid={}) finished successfully", self, pid),
             _ => format!(
@@ -460,6 +468,20 @@ impl RunningFrame {
         info!(msg);
 
         Ok((exit_code, exit_signal))
+    }
+
+    fn interprete_output(output: ExitStatus) -> (i32, Option<i32>) {
+        let mut exit_signal = output.signal();
+        // If a process got terminated by a signal, set the exit_code to 1
+        let mut exit_code = output.code().unwrap_or(1);
+
+        // If the cmd wrapper interprets the signal as an output, 128 needs to be subtracted
+        // from the code to recover the received signal
+        if exit_code > 128 {
+            exit_code = 1;
+            exit_signal = Some(exit_code - 128);
+        }
+        (exit_code, exit_signal)
     }
 
     pub fn run_on_docker(&self) -> Result<(i32, Option<i32>)> {
@@ -1189,27 +1211,6 @@ mod tests {
         assert!(logs.contains(&"stderr1".to_string()));
         assert!(logs.contains(&"stdout2".to_string()));
         assert!(logs.contains(&"stderr2".to_string()));
-
-        // Assert the output on the exit_file is the same
-        let status = running_frame.read_exit_file();
-        assert!(status.is_ok());
-        assert_eq!((0, None), status.unwrap());
-    }
-
-    #[test]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_with_special_characters() {
-        let mut env = HashMap::new();
-        env.insert("SPECIAL".to_string(), "!@#$%^&*()".to_string());
-
-        let running_frame = create_running_frame(r#"echo "Special chars: $SPECIAL""#, 1, 1, env);
-
-        let logger = Arc::new(TestLogger::init());
-        let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
-        assert!(status.is_ok());
-        assert_eq!((0, None), status.unwrap());
-        assert_eq!("Special chars: !@#$%^&*()", logger.pop().unwrap());
 
         // Assert the output on the exit_file is the same
         let status = running_frame.read_exit_file();

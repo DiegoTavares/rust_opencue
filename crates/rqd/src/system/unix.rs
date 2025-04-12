@@ -12,7 +12,7 @@ use std::{
 use dashmap::DashMap;
 use itertools::Itertools;
 use miette::{IntoDiagnostic, Result, miette};
-use nix::sys::signal::{Signal, kill};
+use nix::sys::signal::{Signal, kill, killpg};
 use opencue_proto::host::HardwareState;
 use sysinfo::{
     DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System,
@@ -861,7 +861,7 @@ impl SystemManager for UnixSystem {
     }
 
     fn kill(&self, pid: u32) -> Result<()> {
-        kill(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGTERM)
+        killpg(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGTERM)
             .map_err(|err| miette!("Failed to kill {pid}. {err}"))
     }
 

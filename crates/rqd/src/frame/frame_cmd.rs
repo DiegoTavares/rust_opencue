@@ -31,21 +31,49 @@ impl FrameCmdBuilder {
         let args: Vec<&str> = self.cmd.get_args().filter_map(|arg| arg.to_str()).collect();
         let cmd_str = args.join(" ");
         let mut file = File::create(&self.entrypoint_file_path).into_diagnostic()?;
-
         let script = format!(
-            "#!{}\n\
-            source \"{}\"\n\
-            exit_code=$?\n\
-            {}\n\
-            exit $exit_code\n",
+            r#"#!{}
+wait_for_output() {{
+    # Wait for the command to complete
+    wait $command_pid
+    exit_code=$1
+
+    # Write the exit code to the specified file
+    {}
+    exit $exit_code
+}}
+
+# Function to handle signals
+handle_signal() {{
+    local signal=$1
+    # Forward the signal to the child process if it exists
+    if [ -n "$command_pid" ] && kill -0 $command_pid 2>/dev/null; then
+        kill -$signal $command_pid
+        wait_for_output $signal
+    fi
+}}
+
+# Set up signal handling
+trap 'handle_signal TERM' SIGTERM
+trap 'handle_signal INT' SIGINT
+trap 'handle_signal HUP' SIGHUP
+
+# Start the command and get its PID
+eval "{}"
+exit_code=$?
+command_pid=$!
+
+wait_for_output $exit_code
+"#,
             self.shell,
-            cmd_str,
             if let Some(exit_file) = &self.exit_file_path {
                 format!("echo $exit_code > {}\n", exit_file)
             } else {
                 String::new()
-            }
+            },
+            cmd_str
         );
+
         self.end_cmd = Some(script.clone());
 
         file.write_all(script.as_bytes()).into_diagnostic()?;
