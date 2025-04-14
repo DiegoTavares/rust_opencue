@@ -33,6 +33,8 @@ trap 'handle_signal HUP' SIGHUP
 # Start the command and get its PID
 eval "$1"
 exit_code=$?
+
+# Capture the pid of the command spawn by the eval expression
 command_pid=$!
 
 wait_for_output $exit_code
