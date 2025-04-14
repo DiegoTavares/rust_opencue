@@ -62,6 +62,7 @@ pub struct MachineConfig {
     pub proc_loadavg_path: String,
     pub temp_path: String,
     pub core_multiplier: u32,
+    pub use_session_id_for_proc_lineage: bool,
 }
 
 impl Default for MachineConfig {
@@ -80,6 +81,7 @@ impl Default for MachineConfig {
             proc_loadavg_path: "/proc/loadavg".to_string(),
             temp_path: "/tmp".to_string(),
             core_multiplier: 100,
+            use_session_id_for_proc_lineage: true,
         }
     }
 }

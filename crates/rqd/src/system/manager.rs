@@ -60,7 +60,7 @@ pub trait SystemManager {
     fn collect_proc_stats(&self, pid: u32, log_path: String) -> Result<Option<ProcessStats>>;
 
     /// Update info about procs currently active
-    fn refresh_procs(&self, pids: Vec<u32>);
+    fn refresh_procs(&self);
 
     /// Kill a pid
     fn kill(&self, pid: u32) -> Result<()>;

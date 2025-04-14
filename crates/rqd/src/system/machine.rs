@@ -149,7 +149,7 @@ impl MachineMonitor {
 
     async fn update_procs(&self) {
         let system_manager = self.system_manager.lock().await;
-        system_manager.refresh_procs(self.running_frames_cache.pids());
+        system_manager.refresh_procs();
     }
 
     async fn collect_and_send_host_report(&self) -> Result<()> {
