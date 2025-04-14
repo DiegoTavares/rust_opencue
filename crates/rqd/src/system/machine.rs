@@ -384,7 +384,7 @@ pub trait Machine {
     ///  * [EINVAL] The value of the sig argument is an invalid or unsupported signal number.
     ///  * [EPERM] The process does not have permission to send the signal to any receiving process.
     ///  * [ESRCH] No process or process group can be found corresponding to that specified by pid.
-    async fn kill(&self, pid: u32) -> Result<()>;
+    async fn kill_session(&self, pid: u32, force: bool) -> Result<()>;
 
     async fn force_kill(&self, pids: &Vec<u32>) -> Result<()>;
 
@@ -524,9 +524,13 @@ impl Machine for MachineMonitor {
             .unwrap_or("noname".to_string())
     }
 
-    async fn kill(&self, pid: u32) -> Result<()> {
+    async fn kill_session(&self, pid: u32, force: bool) -> Result<()> {
         let system = self.system_manager.lock().await;
-        system.kill(pid)
+        if force {
+            system.force_kill_session(pid)
+        } else {
+            system.kill_session(pid)
+        }
     }
 
     async fn force_kill(&self, pids: &Vec<u32>) -> Result<()> {

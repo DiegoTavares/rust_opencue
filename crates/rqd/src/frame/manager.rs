@@ -311,7 +311,7 @@ impl FrameManager {
                         "Killing frame {running_frame}({frame_pid}) by request.\n\
                         Reason: {reason}"
                     );
-                    self.machine.kill(frame_pid).await?;
+                    self.machine.kill_session(frame_pid, false).await?;
                     self.monitor_killed_frame(frame_pid, &running_frame);
 
                     Ok(Some(()))
@@ -340,6 +340,7 @@ impl FrameManager {
         let interval_seconds = self.config.runner.kill_monitor_interval.as_secs();
         let mut monitor_limit_seconds = self.config.runner.kill_monitor_timeout.as_secs();
         let force_kill = self.config.runner.force_kill_after_timeout;
+        let mut tried_to_force_kill_session = false;
         let mut interval = time::interval(self.config.runner.kill_monitor_interval);
         let kill_request_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -360,27 +361,47 @@ impl FrameManager {
                 if let Some(mut lineage) = active_lineage {
                     lineage.push(frame_pid);
                     // Check limit before decrementing as tick() returns immediately on the first call
-                    if monitor_limit_seconds <= 0 {
-                        if force_kill {
-                            match machine.force_kill(&lineage).await {
-                                Ok(()) => info!(
-                                    "Kill timeout for {}. Used force_kill on pending processes. \
-                                    Kill has been requested at {} but proc({}) lineage is still active: {:?}.",
-                                    job_str, kill_request_time, frame_pid, lineage
-                                ),
+                    if monitor_limit_seconds <= 0 || tried_to_force_kill_session {
+                        // Notify only
+                        if !force_kill {
+                            error!(
+                                "Gave up waiting on {} termination. \
+                                Kill has been requested at {} but proc({}) lineage is still active: {:?}.",
+                                job_str, kill_request_time, frame_pid, lineage
+                            );
+                            break;
+                        }
+
+                        // Force kill
+                        if !tried_to_force_kill_session {
+                            // First try to force kill the session
+                            match machine.kill_session(frame_pid, true).await {
+                                Ok(()) => {
+                                    tried_to_force_kill_session = true;
+                                    info!(
+                                        "Kill timeout for {}. Used session force_kill on \
+                                        session_id {} to kill {:?}",
+                                        job_str, frame_pid, lineage
+                                    )
+                                }
                                 Err(err) => warn!(
                                     "Failed to force_kill {} lineage = {:?}. {}",
                                     job_str, lineage, err
                                 ),
                             }
                         } else {
-                            error!(
-                                "Gave up waiting on {} termination. \
-                                Kill has been requested at {} but proc({}) lineage is still active: {:?}.",
-                                job_str, kill_request_time, frame_pid, lineage
-                            );
+                            match machine.force_kill(&lineage).await {
+                                Ok(()) => info!(
+                                    "Kill timeout for {}. Used force_kill on {:?}",
+                                    job_str, lineage
+                                ),
+                                Err(err) => warn!(
+                                    "Failed to force_kill {} lineage = {:?}. {}",
+                                    job_str, lineage, err
+                                ),
+                            }
+                            break;
                         }
-                        break;
                     } else {
                         info!(
                             "Frame {} still being killed. \
@@ -392,16 +413,11 @@ impl FrameManager {
                     break;
                 }
 
-                monitor_limit_seconds -= interval_seconds;
+                if monitor_limit_seconds >= interval_seconds {
+                    monitor_limit_seconds -= interval_seconds;
+                }
             }
         });
-        // if let Some(pids_to_kill) = active_lineage {
-        //     if self.config.runner.kill_force_after_limit {
-        //         tokio::spawn(async move {
-        //             self.machine.force_kill(pids_to_kill).await;
-        //         });
-        //     }
-        // }
     }
 }
 

@@ -62,8 +62,11 @@ pub trait SystemManager {
     /// Update info about procs currently active
     fn refresh_procs(&self);
 
-    /// Kill a pid
-    fn kill(&self, pid: u32) -> Result<()>;
+    /// Kill a session using the session pid
+    fn kill_session(&self, session_pid: u32) -> Result<()>;
+
+    /// Force kill a session using the session pid
+    fn force_kill_session(&self, session_pid: u32) -> Result<()>;
 
     /// Force kill a list of pids
     fn force_kill(&self, pids: &Vec<u32>) -> Result<()>;

@@ -548,6 +548,7 @@ impl UnixSystem {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         if self.config.use_session_id_for_proc_lineage {
+            self.procs_lineage_cache.clear();
             // Group all processes by session_id
             for (session_pid, pid) in sysinfo.processes().iter().map(|(children_pid, proc)| {
                 let session_pid = proc.session_id().unwrap_or(Pid::from_u32(0)).as_u32();
@@ -951,9 +952,20 @@ impl SystemManager for UnixSystem {
         self.refresh_procs_cache();
     }
 
-    fn kill(&self, pid: u32) -> Result<()> {
-        killpg(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGTERM)
-            .map_err(|err| miette!("Failed to kill {pid}. {err}"))
+    fn kill_session(&self, session_pid: u32) -> Result<()> {
+        killpg(
+            nix::unistd::Pid::from_raw(session_pid as i32),
+            Signal::SIGTERM,
+        )
+        .map_err(|err| miette!("Failed to kill {session_pid}. {err}"))
+    }
+
+    fn force_kill_session(&self, session_pid: u32) -> Result<()> {
+        killpg(
+            nix::unistd::Pid::from_raw(session_pid as i32),
+            Signal::SIGKILL,
+        )
+        .map_err(|err| miette!("Failed to kill {session_pid}. {err}"))
     }
 
     fn force_kill(&self, pids: &Vec<u32>) -> Result<()> {
