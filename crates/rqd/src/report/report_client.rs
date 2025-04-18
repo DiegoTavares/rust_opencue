@@ -1,29 +1,53 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::config::Config;
 use async_trait::async_trait;
-use miette::{Context, IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result};
 use opencue_proto::report::{self as pb, rqd_report_interface_client::RqdReportInterfaceClient};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
+use tower::ServiceBuilder;
+use tower::util::rng::HasherRng;
+
+use super::retry::backoff::{ExponentialBackoffMaker, MakeBackoff};
+use super::retry::backoff_policy::BackoffPolicy;
+use super::retry::{Retry, RetryLayer};
 
 pub(crate) struct ReportClient {
-    client: Arc<Mutex<RqdReportInterfaceClient<Channel>>>,
+    client: Arc<Mutex<RqdReportInterfaceClient<Retry<BackoffPolicy, Channel>>>>,
 }
 
 impl ReportClient {
     pub async fn build(config: &Config) -> Result<Self> {
-        let client =
-            RqdReportInterfaceClient::connect(format!("http://{}", config.grpc.cuebot_url))
-                .await
-                .into_diagnostic()
-                .wrap_err(format!(
-                    "Failed to connect to Cuebot Report Server: {}",
-                    config.grpc.cuebot_url
-                ))?;
-        Ok(Self {
-            client: Arc::new(Mutex::new(client)),
-        })
+        let endpoint = format!("http://{}", config.grpc.cuebot_url.clone());
+
+        let channel = tonic::transport::Channel::from_shared(endpoint)
+            .into_diagnostic()?
+            .connect_lazy();
+
+        // Use a backoff stratery to retry failed requests
+        let backoff = ExponentialBackoffMaker::new(
+            Duration::from_millis(50),
+            Duration::from_secs(300),
+            100.0,
+            HasherRng::default(),
+        )
+        .into_diagnostic()?
+        .make_backoff();
+
+        // Requests will only return error after 5 attempts
+        let retry_policy = BackoffPolicy {
+            attempts: 10,
+            backoff,
+        };
+        let retry_layer = RetryLayer::new(retry_policy);
+        let channel = ServiceBuilder::new().layer(retry_layer).service(channel);
+
+        let client = Arc::new(Mutex::new(RqdReportInterfaceClient::new(channel)));
+
+        // Return the constructed client
+        Ok(Self { client })
     }
 }
 
