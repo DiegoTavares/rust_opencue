@@ -1,4 +1,4 @@
-use std::future;
+use std::usize;
 
 use super::{
     Outcome, Policy,
@@ -11,15 +11,41 @@ use http_body_util::{BodyExt, Full};
 use prost::bytes::Bytes;
 // use hyper::body::Bytes;
 use tonic::body::Body;
-use tracing::{info, warn};
+use tracing::warn;
 
 type Req = http::Request<Body>;
 type Res = http::Response<Body>;
 
 #[derive(Clone)]
 pub struct BackoffPolicy {
-    pub attempts: usize,
+    /// Maximum number of retry attempts.
+    /// If `None`, will retry indefinitely based on the policy logic.
+    pub attempts: Option<usize>,
+
+    /// The backoff strategy to use between retry attempts.
+    /// Determines how long to wait before the next retry.
     pub backoff: ExponentialBackoff,
+}
+
+impl BackoffPolicy {
+    /// Checks if there are still retry attempts left.
+    ///
+    /// This function determines whether more retry attempts can be made based on
+    /// the configured maximum number of attempts.
+    ///
+    /// Returns:
+    ///   - `true` if more retry attempts are allowed
+    ///   - `false` if maximum attempts have been reached
+    pub fn has_attempts_left(&mut self) -> bool {
+        if self.attempts.unwrap_or(usize::MAX) > 0 {
+            if let Some(remaining_attemps) = self.attempts {
+                self.attempts.replace(remaining_attemps);
+            }
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl<E> Policy<Req, Res, E> for BackoffPolicy {
@@ -35,9 +61,8 @@ impl<E> Policy<Req, Res, E> for BackoffPolicy {
                         | StatusCode::BAD_GATEWAY
                         | StatusCode::SERVICE_UNAVAILABLE
                 ) {
-                    if self.attempts > 0 {
+                    if self.has_attempts_left() {
                         warn!("Retrying for StatusCode={}", response.status());
-                        self.attempts -= 1;
                         Outcome::Retry(self.backoff.next_backoff())
                     } else {
                         Outcome::Return(result)
@@ -47,9 +72,8 @@ impl<E> Policy<Req, Res, E> for BackoffPolicy {
                 }
             }
             Err(_err) => {
-                if self.attempts > 0 {
+                if self.has_attempts_left() {
                     warn!("Retrying for Transport error.");
-                    self.attempts -= 1;
                     // Retry all transport errors
                     Outcome::Retry(self.backoff.next_backoff())
                 } else {
@@ -88,6 +112,16 @@ async fn consume_unsync_body(body: Body) -> Vec<u8> {
         .unwrap()
 }
 
+/// Creates a new HTTP request using the provided parts and body data.
+///
+/// # Arguments
+///
+/// * `parts` - The HTTP request parts containing method, URI, headers, etc.
+/// * `body` - The bytes that will form the body of the request
+///
+/// # Returns
+///
+/// A complete HTTP request with the specified parts and body.
 fn create_request(parts: Parts, body: Vec<u8>) -> http::Request<Body> {
     let bytes = Bytes::from(body);
     let full_body = Full::new(bytes);

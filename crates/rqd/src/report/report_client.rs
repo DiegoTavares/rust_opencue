@@ -38,7 +38,7 @@ impl ReportClient {
 
         // Requests will only return error after 5 attempts
         let retry_policy = BackoffPolicy {
-            attempts: 10,
+            attempts: None,
             backoff,
         };
         let retry_layer = RetryLayer::new(retry_policy);
