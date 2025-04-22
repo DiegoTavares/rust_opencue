@@ -1,11 +1,9 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::config::Config;
 use async_trait::async_trait;
 use miette::{IntoDiagnostic, Result};
 use opencue_proto::report::{self as pb, rqd_report_interface_client::RqdReportInterfaceClient};
-use tokio::sync::Mutex;
 use tonic::transport::Channel;
 use tower::ServiceBuilder;
 use tower::util::rng::HasherRng;
@@ -15,7 +13,7 @@ use super::retry::backoff_policy::BackoffPolicy;
 use super::retry::{Retry, RetryLayer};
 
 pub(crate) struct ReportClient {
-    client: Arc<Mutex<RqdReportInterfaceClient<Retry<BackoffPolicy, Channel>>>>,
+    client: RqdReportInterfaceClient<Retry<BackoffPolicy, Channel>>,
 }
 
 impl ReportClient {
@@ -44,7 +42,8 @@ impl ReportClient {
         let retry_layer = RetryLayer::new(retry_policy);
         let channel = ServiceBuilder::new().layer(retry_layer).service(channel);
 
-        let client = Arc::new(Mutex::new(RqdReportInterfaceClient::new(channel)));
+        let client = RqdReportInterfaceClient::new(channel);
+        // let client = Arc::new(RqdReportInterfaceClient::new(channel));
 
         // Return the constructed client
         Ok(Self { client })
@@ -81,13 +80,13 @@ impl ReportInterface for ReportClient {
         render_host: pb::RenderHost,
         core_detail: pb::CoreDetail,
     ) -> Result<()> {
-        let mut client = self.client.lock().await;
         let mut request = pb::RqdReportRqdStartupRequest::default();
         request.boot_report = Some(pb::BootReport {
             host: Some(render_host),
             core_info: Some(core_detail),
         });
-        client
+        self.client
+            .clone()
             .report_rqd_startup(request)
             .await
             .into_diagnostic()
@@ -102,7 +101,6 @@ impl ReportInterface for ReportClient {
         exit_signal: u32,
         run_time: u32,
     ) -> Result<()> {
-        let mut client = self.client.lock().await;
         let mut request = pb::RqdReportRunningFrameCompletionRequest::default();
         request.frame_complete_report = Some(pb::FrameCompleteReport {
             host: Some(render_host),
@@ -111,7 +109,8 @@ impl ReportInterface for ReportClient {
             exit_signal: exit_signal as i32,
             run_time: run_time as i32,
         });
-        client
+        self.client
+            .clone()
             .report_running_frame_completion(request)
             .await
             .into_diagnostic()
@@ -124,14 +123,14 @@ impl ReportInterface for ReportClient {
         running_frames: Vec<pb::RunningFrameInfo>,
         core_detail: pb::CoreDetail,
     ) -> Result<()> {
-        let mut client = self.client.lock().await;
         let mut request = pb::RqdReportStatusRequest::default();
         request.host_report = Some(pb::HostReport {
             host: Some(render_host),
             frames: running_frames,
             core_info: Some(core_detail),
         });
-        client
+        self.client
+            .clone()
             .report_status(request)
             .await
             .into_diagnostic()
