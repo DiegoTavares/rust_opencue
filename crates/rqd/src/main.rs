@@ -62,8 +62,11 @@ async fn main() -> miette::Result<()> {
         machine: mm_clone.clone(),
     });
 
-    // Spawn machine monitor
-    let machine_monitor_handle = machine_monitor.start();
+    // Spawn machine monitor on a new task to prevent it from locking the main task
+    let machine_monitor_handle = {
+        let mm = Arc::clone(&machine_monitor);
+        tokio::spawn(async move { mm.start().await })
+    };
 
     if let Err(err) = frame_manager.recover_snapshots().await {
         warn!("Failed to recover frames from snapshot: {}", err);
