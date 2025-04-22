@@ -24,11 +24,11 @@ impl ReportClient {
             .into_diagnostic()?
             .connect_lazy();
 
-        // Use a backoff stratery to retry failed requests
+        // Use a backoff strategy to retry failed requests
         let backoff = ExponentialBackoffMaker::new(
-            Duration::from_millis(50),
-            Duration::from_secs(300),
-            100.0,
+            config.grpc.backoff_delay_min,
+            config.grpc.backoff_delay_max,
+            config.grpc.backoff_jitter_percentage,
             HasherRng::default(),
         )
         .into_diagnostic()?
