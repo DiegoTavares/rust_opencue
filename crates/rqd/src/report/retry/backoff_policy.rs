@@ -37,13 +37,13 @@ impl BackoffPolicy {
     ///   - `true` if more retry attempts are allowed
     ///   - `false` if maximum attempts have been reached
     pub fn has_attempts_left(&mut self) -> bool {
-        if self.attempts.unwrap_or(usize::MAX) > 0 {
-            if let Some(remaining_attemps) = self.attempts {
-                self.attempts.replace(remaining_attemps);
+        match self.attempts {
+            Some(0) => false,
+            Some(ref mut atttemps_left) => {
+                *atttemps_left -= 1;
+                true
             }
-            true
-        } else {
-            false
+            None => true,
         }
     }
 }
@@ -139,4 +139,152 @@ fn create_request(parts: Parts, body: Vec<u8>) -> http::Request<Body> {
     *request.headers_mut() = parts.headers;
 
     request
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::report::retry::backoff::MakeBackoff;
+
+    use super::super::backoff::ExponentialBackoffMaker;
+    use super::*;
+    use http::{Request, StatusCode};
+    use http_body_util::Empty;
+    use std::time::Duration;
+    use tower::util::rng::HasherRng;
+
+    fn create_test_policy() -> BackoffPolicy {
+        let mut backoff_maker = ExponentialBackoffMaker::new(
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            2.0,
+            HasherRng::default(),
+        )
+        .unwrap();
+
+        BackoffPolicy {
+            attempts: Some(3),
+            backoff: backoff_maker.make_backoff(),
+        }
+    }
+
+    fn create_test_request() -> Req {
+        Request::builder()
+            .method("POST")
+            .uri("http://example.com")
+            .body(Body::new(Empty::new().boxed()))
+            .unwrap()
+    }
+
+    fn create_response(status: StatusCode) -> Res {
+        http::Response::builder()
+            .status(status)
+            .body(Body::new(Empty::new().boxed()))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_has_attempts_left() {
+        // Test with Some(n) attempts
+        let mut policy = BackoffPolicy {
+            attempts: Some(2),
+            backoff: create_test_policy().backoff,
+        };
+
+        assert!(policy.has_attempts_left());
+        assert!(policy.has_attempts_left());
+        assert!(!policy.has_attempts_left());
+
+        // Test with None (unlimited) attempts
+        let mut policy = BackoffPolicy {
+            attempts: None,
+            backoff: create_test_policy().backoff,
+        };
+
+        for _ in 0..10 {
+            assert!(policy.has_attempts_left());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retry_success_response() {
+        let mut policy = create_test_policy();
+        let mut req = create_test_request();
+
+        // Test with 200 OK response
+        let res: Result<Res, &str> = Ok(create_response(StatusCode::OK));
+        let outcome = policy.retry(&mut req, res);
+
+        match outcome {
+            Outcome::Return(_) => {}
+            _ => panic!("Expected Outcome::Return for OK response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retry_error_response() {
+        let mut policy = create_test_policy();
+        let mut req = create_test_request();
+
+        // Test with server error response
+        let res: Result<Res, &str> = Ok(create_response(StatusCode::INTERNAL_SERVER_ERROR));
+        let outcome = policy.retry(&mut req, res);
+
+        match outcome {
+            Outcome::Retry(_) => {}
+            _ => panic!("Expected Outcome::Retry for server error response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retry_transport_error() {
+        let mut policy = create_test_policy();
+        let mut req = create_test_request();
+
+        // Test with transport error
+        let res: Result<Res, &str> = Err("transport error");
+        let outcome = policy.retry(&mut req, res);
+
+        match outcome {
+            Outcome::Retry(_) => {}
+            _ => panic!("Expected Outcome::Retry for transport error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_attempts_left() {
+        let mut policy = BackoffPolicy {
+            attempts: Some(0),
+            backoff: create_test_policy().backoff,
+        };
+        let mut req = create_test_request();
+
+        // Test with server error but no attempts left
+        let res: Result<Res, &str> = Ok(create_response(StatusCode::INTERNAL_SERVER_ERROR));
+        let outcome = policy.retry(&mut req, res);
+
+        match outcome {
+            Outcome::Return(_) => {}
+            _ => panic!("Expected Outcome::Return when no attempts left"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clone_request() {
+        let mut policy = create_test_policy();
+        let req = create_test_request();
+
+        let (new_req, cloned_req_opt) = <BackoffPolicy as Policy<
+            http::Request<tonic::body::Body>,
+            http::Response<tonic::body::Body>,
+            &str,
+        >>::clone_request(&mut policy, req);
+
+        assert!(cloned_req_opt.is_some());
+        let cloned_req = cloned_req_opt.unwrap();
+
+        assert_eq!(new_req.method(), cloned_req.method());
+        assert_eq!(new_req.uri(), cloned_req.uri());
+        assert_eq!(new_req.version(), cloned_req.version());
+        assert_eq!(new_req.headers(), cloned_req.headers());
+    }
 }
