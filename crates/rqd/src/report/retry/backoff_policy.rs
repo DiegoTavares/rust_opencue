@@ -6,7 +6,6 @@ use super::{
     policy::ClonedRequest,
 };
 use futures::{FutureExt, TryStreamExt};
-// use futures_util::future;
 use http::{Request, StatusCode, request::Parts};
 use http_body_util::{BodyExt, Full};
 use prost::bytes::Bytes;
@@ -50,10 +49,9 @@ impl BackoffPolicy {
 }
 
 impl<E> Policy<Req, Res, E> for BackoffPolicy {
-    // type Future = future::Ready<()>;
     type Future = tokio::time::Sleep;
     type ClonedOutput = ClonedReq<Req>;
-    type ClonedFuture = Pin<Box<dyn Future<Output = Self::ClonedOutput> + Send>>;
+    type ClonedFuture = Pin<Box<dyn std::future::Future<Output = Self::ClonedOutput> + Send>>;
 
     fn retry(&mut self, _req: &mut Req, result: Result<Res, E>) -> Outcome<Self::Future, Res, E> {
         match &result {

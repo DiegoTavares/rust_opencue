@@ -19,7 +19,6 @@ pin_project! {
         S: Service<Request>,
     {
         request: Option<Request>,
-        result: Option<Result<S::Response, S::Error>>,
         #[pin]
         retry: Retry<P, S>,
         #[pin]
@@ -56,7 +55,6 @@ where
     pub(crate) fn new(retry: Retry<P, S>, request: Request) -> ResponseFuture<P, S, Request> {
         ResponseFuture {
             request: Some(request),
-            result: None,
             retry,
             state: State::Initialized,
         }
@@ -118,19 +116,16 @@ where
                 }
 
                 StateProj::Called { future } => {
-                    *this.result = Some(ready!(future.poll(cx)));
+                    let result = ready!(future.poll(cx));
                     trace!("Checked request at: Called");
                     if let Some(req) = &mut this.request {
-                        match this
-                            .retry
-                            .policy
-                            .retry(req, this.result.take().expect("consume result"))
-                        {
+                        match this.retry.policy.retry(req, result) {
                             Outcome::Retry(waiting) => this.state.set(State::Waiting { waiting }),
                             Outcome::Return(result) => return Poll::Ready(result),
                         }
                     } else {
-                        panic!("Invalid state")
+                        // This branch is unreachable
+                        return Poll::Ready(result);
                     }
                 }
 

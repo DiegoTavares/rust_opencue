@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use crate::config::config::Config;
 use async_trait::async_trait;
 use miette::{IntoDiagnostic, Result};
@@ -34,7 +32,7 @@ impl ReportClient {
         .into_diagnostic()?
         .make_backoff();
 
-        // Requests will only return error after 5 attempts
+        // Requests will retry indefinitely
         let retry_policy = BackoffPolicy {
             attempts: None,
             backoff,
