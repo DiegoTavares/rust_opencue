@@ -119,7 +119,13 @@ async fn consume_unsync_body(body: Body) -> Vec<u8> {
             Ok(acc)
         })
         .await
-        .unwrap()
+        .unwrap_or_else(|e| {
+            warn!(
+                "Failed to consume body stream on grpc backoff policy. {}",
+                e
+            );
+            Vec::new()
+        })
 }
 
 /// Creates a new HTTP request using the provided parts and body data.
@@ -144,7 +150,7 @@ fn create_request(parts: Parts, body: Vec<u8>) -> http::Request<Body> {
                 .map_err(|_err| tonic::Status::internal("Body error"))
                 .boxed(),
         ))
-        .unwrap();
+        .expect("Failed to build grpc request from body and parts");
 
     *request.headers_mut() = parts.headers;
 
