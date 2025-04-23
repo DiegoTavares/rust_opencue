@@ -1,10 +1,11 @@
-use std::usize;
+use std::{pin::Pin, usize};
 
 use super::{
     Outcome, Policy,
     backoff::{Backoff, ExponentialBackoff},
+    policy::ClonedRequest,
 };
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
 // use futures_util::future;
 use http::{Request, StatusCode, request::Parts};
 use http_body_util::{BodyExt, Full};
@@ -51,6 +52,8 @@ impl BackoffPolicy {
 impl<E> Policy<Req, Res, E> for BackoffPolicy {
     // type Future = future::Ready<()>;
     type Future = tokio::time::Sleep;
+    type ClonedOutput = ClonedReq<Req>;
+    type ClonedFuture = Pin<Box<dyn Future<Output = Self::ClonedOutput> + Send>>;
 
     fn retry(&mut self, _req: &mut Req, result: Result<Res, E>) -> Outcome<Self::Future, Res, E> {
         match &result {
@@ -83,21 +86,30 @@ impl<E> Policy<Req, Res, E> for BackoffPolicy {
         }
     }
 
-    fn clone_request(&mut self, req: Req) -> (Req, Option<Req>) {
+    fn clone_request(&mut self, req: Req) -> Self::ClonedFuture {
         // Convert body to Bytes so it can be cloned
         let (parts, original_body) = req.into_parts();
 
-        // Try to capture the Bytes from the original body
-        // This is circumvoluted, I'm not sure how to call an async function within a sync function that is used inside a future later
-        let bytes =
-            futures::executor::block_on(async move { consume_unsync_body(original_body).await });
+        Box::pin(consume_unsync_body(original_body).then(|bytes| async move {
+            // Re-create the request with the captured bytes in a new BoxBody
+            let original_req = create_request(parts.clone(), bytes.clone());
+            let cloned_req = create_request(parts, bytes);
+            ClonedReq {
+                original_req,
+                cloned_req,
+            }
+        }))
+    }
+}
 
-        // Re-create the request with the captured bytes in a new BoxBody
-        let req = create_request(parts.clone(), bytes.clone());
-        let cloned_req = create_request(parts, bytes);
+pub struct ClonedReq<Req> {
+    pub original_req: Req,
+    pub cloned_req: Req,
+}
 
-        (req, Some(cloned_req))
-        // Some(req.clone())
+impl ClonedRequest<Req> for ClonedReq<Req> {
+    fn inner(self) -> (Req, Req) {
+        (self.original_req, self.cloned_req)
     }
 }
 
@@ -273,14 +285,13 @@ mod tests {
         let mut policy = create_test_policy();
         let req = create_test_request();
 
-        let (new_req, cloned_req_opt) = <BackoffPolicy as Policy<
+        let (new_req, cloned_req) = <BackoffPolicy as Policy<
             http::Request<tonic::body::Body>,
             http::Response<tonic::body::Body>,
             &str,
-        >>::clone_request(&mut policy, req);
-
-        assert!(cloned_req_opt.is_some());
-        let cloned_req = cloned_req_opt.unwrap();
+        >>::clone_request(&mut policy, req)
+        .await
+        .inner();
 
         assert_eq!(new_req.method(), cloned_req.method());
         assert_eq!(new_req.uri(), cloned_req.uri());

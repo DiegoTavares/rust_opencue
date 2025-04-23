@@ -47,6 +47,9 @@ pub trait Policy<Req, Res, E> {
     /// The [`Future`] type returned by [`Policy::retry`].
     type Future: Future<Output = ()>;
 
+    type ClonedOutput: ClonedRequest<Req>;
+    type ClonedFuture: Future<Output = Self::ClonedOutput>;
+
     /// Check the policy if a certain request should be retried.
     ///
     /// This method is passed a reference to the original request, and either
@@ -86,7 +89,11 @@ pub trait Policy<Req, Res, E> {
     ///
     /// If the request cannot be cloned, return [`None`]. Moreover, the retry
     /// function will not be called if the [`None`] is returned.
-    fn clone_request(&mut self, req: Req) -> (Req, Option<Req>);
+    fn clone_request(&mut self, req: Req) -> Self::ClonedFuture;
+}
+
+pub trait ClonedRequest<Req> {
+    fn inner(self) -> (Req, Req);
 }
 
 /// Outcome from [`Policy::retry`] with two choices:
@@ -102,4 +109,16 @@ pub enum Outcome<Fut, Resp, Err> {
 
 // Ensure `Policy` is object safe
 #[cfg(test)]
-fn _obj_safe(_: Box<dyn Policy<(), (), (), Future = futures::future::Ready<()>>>) {}
+fn _obj_safe(
+    _: Box<
+        dyn Policy<
+                (),
+                (),
+                (),
+                Future = futures::future::Ready<()>,
+                ClonedOutput = (),
+                ClonedFuture = futures::future::Ready<()>,
+            >,
+    >,
+) {
+}

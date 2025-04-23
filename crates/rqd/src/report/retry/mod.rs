@@ -94,9 +94,6 @@ where
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
-        let (request, cloned) = self.policy.clone_request(request);
-        let future = self.service.call(request);
-
-        ResponseFuture::new(cloned, self.clone(), future)
+        ResponseFuture::new(self.clone(), request)
     }
 }
