@@ -1,4 +1,4 @@
-use std::{pin::Pin, usize};
+use std::pin::Pin;
 
 use super::{
     Outcome, Policy,
@@ -9,7 +9,6 @@ use futures::{FutureExt, TryStreamExt};
 use http::{Request, StatusCode, request::Parts};
 use http_body_util::{BodyExt, Full};
 use prost::bytes::Bytes;
-// use hyper::body::Bytes;
 use tonic::body::Body;
 use tracing::warn;
 
@@ -17,6 +16,13 @@ type Req = http::Request<Body>;
 type Res = http::Response<Body>;
 
 #[derive(Clone)]
+/// Policy for implementing retry with backoff strategies.
+///
+/// # Warning
+///
+/// This policy should only be used for relatively small requests as the entire
+/// request body has to be buffered and stored in memory for retry purposes.
+/// Large request bodies could lead to excessive memory usage.
 pub struct BackoffPolicy {
     /// Maximum number of retry attempts.
     /// If `None`, will retry indefinitely based on the policy logic.
@@ -39,8 +45,8 @@ impl BackoffPolicy {
     pub fn has_attempts_left(&mut self) -> bool {
         match self.attempts {
             Some(0) => false,
-            Some(ref mut atttemps_left) => {
-                *atttemps_left -= 1;
+            Some(ref mut attemps_left) => {
+                *attemps_left -= 1;
                 true
             }
             None => true,
