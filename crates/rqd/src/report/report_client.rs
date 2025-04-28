@@ -70,7 +70,12 @@ impl ReportClient {
         String,
         RqdReportInterfaceClient<Retry<BackoffPolicy, Channel>>,
     )> {
-        let endpoint = format!("http://{}", Self::draw_endpoint(&config.cuebot_endpoints)?);
+        let endpoint = Self::draw_endpoint(&config.cuebot_endpoints)?;
+        let endpoint = if !endpoint.starts_with("http") {
+            format!("http://{}", endpoint)
+        } else {
+            endpoint
+        };
         let channel = tonic::transport::Channel::from_shared(endpoint.clone())
             .into_diagnostic()?
             .connect_lazy();
