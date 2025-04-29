@@ -245,7 +245,12 @@ impl RunningFrame {
         }
     }
 
-    fn start(&self, pid: u32) -> Result<()> {
+    /// Transition the frame state from Created to Running.
+    ///
+    /// If the frame has already started or finished, log the error and don't change the status.
+    /// Returning an error is pointless as we want the frame that trigger this transition to finish
+    /// regardless
+    fn start(&self, pid: u32) {
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
 
         match &mut *state {
@@ -255,17 +260,12 @@ impl RunningFrame {
                     start_time: SystemTime::now(),
                     launch_thread_handle: created_state.launch_thread_handle.take(),
                 });
-                Ok(())
             }
-            FrameState::Running(running_state) => Err(miette!(
+            FrameState::Running(running_state) => warn!(
                 "Invalid State. Frame {} has already started {:?}",
-                self,
-                running_state
-            )),
-            FrameState::Finished(_) => Err(miette!(
-                "Invalid State. Frame {} has already finished",
-                self
-            )),
+                self, running_state
+            ),
+            FrameState::Finished(_) => warn!("Invalid States. Frame {} has already finished", self),
         }
     }
 
@@ -373,6 +373,7 @@ impl RunningFrame {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn run_inner(&self, logger: FrameLogger) -> Result<(i32, Option<i32>)> {
+        use miette::Context;
         use nix::libc;
         use tracing::trace;
 
@@ -429,7 +430,7 @@ impl RunningFrame {
 
         // Update frame state with frame pid
         let pid = child.id();
-        self.start(child.id())?;
+        self.start(child.id());
 
         info!(
             "Frame {self} started with pid {pid}, with taskset {}",
@@ -437,7 +438,7 @@ impl RunningFrame {
         );
 
         // Make sure process has been spawned before creating a backup
-        let _ = self.snapshot()?;
+        let _ = self.snapshot();
 
         // Spawn a new thread to follow frame logs
         let (log_pipe_handle, sender) = self.spawn_logger(logger);
@@ -450,7 +451,10 @@ impl RunningFrame {
         if let Err(_) = log_pipe_handle.join() {
             warn!("Failed to join log thread");
         }
-        let output = output.into_diagnostic()?;
+        let output = output
+            .into_diagnostic()
+            .wrap_err(format!("Command for {self} didn't start!"))?;
+
         let (exit_code, exit_signal) = Self::interprete_output(output);
 
         let msg = match exit_code {
