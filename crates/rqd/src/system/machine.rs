@@ -5,7 +5,7 @@ use bytesize::KIB;
 use miette::{IntoDiagnostic, Result, miette};
 use opencue_proto::{
     host::HardwareState,
-    report::{CoreDetail, RenderHost},
+    report::{CoreDetail, HostReport, RenderHost},
 };
 use tokio::{
     select,
@@ -157,25 +157,10 @@ impl MachineMonitor {
 
     async fn collect_and_send_host_report(&self) -> Result<()> {
         let report_client = self.report_client.clone();
-        let system_manager = self.system_manager.lock().await;
-        let host_state = Self::inspect_host_state(&self.maching_config, &system_manager)?;
-        drop(system_manager);
-        // Store the last host_state on self
-        let mut self_host_state_lock = self.last_host_state.lock().await;
-        self_host_state_lock.replace(host_state.clone());
-        drop(self_host_state_lock);
+        let host_report = self.collect_host_report().await?;
 
-        let core_state = { self.core_state.lock().await.clone() };
-        self.monitor_running_frames().await?;
-
-        debug!("Sending host report: {:?}", host_state);
-        report_client
-            .send_host_report(
-                host_state,
-                Arc::clone(&self.running_frames_cache).into_running_frame_vec(),
-                core_state,
-            )
-            .await?;
+        debug!("Sending host report: {:?}", host_report.host);
+        report_client.send_host_report(host_report).await?;
         Ok(())
     }
 
@@ -411,6 +396,8 @@ pub trait Machine {
     async fn unlock_all_cores(&self);
 
     async fn reboot_if_idle(&self) -> Result<()>;
+
+    async fn collect_host_report(&self) -> Result<HostReport>;
 }
 
 #[async_trait]
@@ -601,5 +588,24 @@ impl Machine for MachineMonitor {
             system.reboot();
         }
         Ok(())
+    }
+
+    async fn collect_host_report(&self) -> Result<HostReport> {
+        let system_manager = self.system_manager.lock().await;
+        let render_host = Self::inspect_host_state(&self.maching_config, &system_manager)?;
+        drop(system_manager);
+        // Store the last host_state on self
+        let mut self_host_state_lock = self.last_host_state.lock().await;
+        self_host_state_lock.replace(render_host.clone());
+        drop(self_host_state_lock);
+
+        let core_state = { self.core_state.lock().await.clone() };
+        self.monitor_running_frames().await?;
+
+        Ok(HostReport {
+            host: Some(render_host),
+            frames: Arc::clone(&self.running_frames_cache).into_running_frame_vec(),
+            core_info: Some(core_state),
+        })
     }
 }

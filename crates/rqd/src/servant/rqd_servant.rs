@@ -193,9 +193,19 @@ impl RqdInterface for RqdServant {
     /// Return the HostReport
     async fn report_status(
         &self,
-        request: Request<RqdStaticReportStatusRequest>,
+        _request: Request<RqdStaticReportStatusRequest>,
     ) -> Result<Response<RqdStaticReportStatusResponse>> {
-        todo!()
+        let host_report = self.machine.collect_host_report().await;
+
+        match host_report {
+            Ok(report) => Ok(Response::new(RqdStaticReportStatusResponse {
+                host_report: Some(report),
+            })),
+            Err(err) => Err(tonic::Status::internal(format!(
+                "Failed to collect host report {:?}",
+                err
+            ))),
+        }
     }
 
     /// [Deprecated] Restart the rqd process when it becomes idle
