@@ -1052,8 +1052,6 @@ impl SystemManager for UnixSystem {
             .get(&pid)
             .map(|lineage| lineage.clone())
     }
-
-    // fn get_procs_by_pgid(&self, pgid: u32) -> Option<Vec<u32>> {}
 }
 
 #[cfg(test)]

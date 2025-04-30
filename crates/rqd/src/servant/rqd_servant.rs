@@ -23,6 +23,7 @@ use opencue_proto::{
     },
 };
 use tonic::{Request, Response, async_trait};
+use tracing::info;
 
 pub type MachineImpl = dyn Machine + Sync + Send;
 
@@ -130,15 +131,24 @@ impl RqdInterface for RqdServant {
         &self,
         request: Request<RqdStaticLockRequest>,
     ) -> Result<Response<RqdStaticLockResponse>> {
-        todo!()
+        let cores_to_lock = request.into_inner().cores;
+        let effectively_locked_amount = self.machine.lock_cores(cores_to_lock as u32).await;
+        info!("Lock: {effectively_locked_amount} cores locked from the requeted {cores_to_lock}");
+
+        Ok(Response::new(RqdStaticLockResponse {}))
     }
+
     /// Lock all
     async fn lock_all(
         &self,
-        request: Request<RqdStaticLockAllRequest>,
+        _request: Request<RqdStaticLockAllRequest>,
     ) -> Result<Response<RqdStaticLockAllResponse>> {
-        todo!()
+        self.machine.lock_all_cores().await;
+        info!("Lock: All cores have been locked");
+
+        Ok(Response::new(RqdStaticLockAllResponse {}))
     }
+
     /// Disable NIMBY on host
     async fn nimby_off(
         &self,
@@ -146,6 +156,7 @@ impl RqdInterface for RqdServant {
     ) -> Result<Response<RqdStaticNimbyOffResponse>> {
         todo!()
     }
+
     /// Enable NIMBY on host
     async fn nimby_on(
         &self,
@@ -153,6 +164,7 @@ impl RqdInterface for RqdServant {
     ) -> Result<Response<RqdStaticNimbyOnResponse>> {
         todo!()
     }
+
     /// Reboot the host when it becomes idle
     async fn reboot_idle(
         &self,
@@ -160,6 +172,7 @@ impl RqdInterface for RqdServant {
     ) -> Result<Response<RqdStaticRebootIdleResponse>> {
         todo!()
     }
+
     /// Reboot the host now
     async fn reboot_now(
         &self,
@@ -167,6 +180,7 @@ impl RqdInterface for RqdServant {
     ) -> Result<Response<RqdStaticRebootNowResponse>> {
         todo!()
     }
+
     /// Return the HostReport
     async fn report_status(
         &self,
@@ -174,6 +188,7 @@ impl RqdInterface for RqdServant {
     ) -> Result<Response<RqdStaticReportStatusResponse>> {
         todo!()
     }
+
     /// [Deprecated] Restart the rqd process when it becomes idle
     async fn restart_rqd_idle(
         &self,
@@ -181,6 +196,7 @@ impl RqdInterface for RqdServant {
     ) -> Result<Response<RqdStaticRestartIdleResponse>> {
         todo!()
     }
+
     /// [Deprecated] Restart rqd process now
     async fn restart_rqd_now(
         &self,
@@ -203,18 +219,29 @@ impl RqdInterface for RqdServant {
     ) -> Result<Response<RqdStaticShutdownNowResponse>> {
         todo!()
     }
+
     /// Unlock a number of cores
     async fn unlock(
         &self,
         request: Request<RqdStaticUnlockRequest>,
     ) -> Result<Response<RqdStaticUnlockResponse>> {
-        todo!()
+        let cores_to_unlock = request.into_inner().cores;
+        let effectively_locked_amount = self.machine.unlock_cores(cores_to_unlock as u32).await;
+        info!(
+            "Unlock: {effectively_locked_amount} cores unlocked from the requeted {cores_to_unlock}"
+        );
+
+        Ok(Response::new(RqdStaticUnlockResponse {}))
     }
+
     /// Unlock all cores
     async fn unlock_all(
         &self,
-        request: Request<RqdStaticUnlockAllRequest>,
+        _request: Request<RqdStaticUnlockAllRequest>,
     ) -> Result<Response<RqdStaticUnlockAllResponse>> {
-        todo!()
+        self.machine.unlock_all_cores().await;
+        info!("Unlock: All cores have been unlocked");
+
+        Ok(Response::new(RqdStaticUnlockAllResponse {}))
     }
 }

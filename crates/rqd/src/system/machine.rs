@@ -391,6 +391,14 @@ pub trait Machine {
     /// Check if this pid and any of its children are still active
     /// Returns the list of active children, and none if the pid itself is not active
     async fn get_active_proc_lineage(&self, pid: u32) -> Option<Vec<u32>>;
+
+    async fn lock_cores(&self, count: u32) -> u32;
+
+    async fn lock_all_cores(&self);
+
+    async fn unlock_cores(&self, count: u32) -> u32;
+
+    async fn unlock_all_cores(&self);
 }
 
 #[async_trait]
@@ -432,11 +440,11 @@ impl Machine for MachineMonitor {
         // Record reservation to be reported to cuebot
         if let Ok(_) = &cores_result {
             let mut core_state = self.core_state.lock().await;
-            info!("Before: {:?}", *core_state);
+            debug!("Before: {:?}", *core_state);
             core_state
                 .reserve(num_cores * self.maching_config.core_multiplier)
                 .map_err(|err| miette!(err))?;
-            info!("After: {:?}", *core_state);
+            debug!("After: {:?}", *core_state);
         }
         cores_result
     }
@@ -541,5 +549,25 @@ impl Machine for MachineMonitor {
     async fn get_active_proc_lineage(&self, pid: u32) -> Option<Vec<u32>> {
         let system = self.system_manager.lock().await;
         system.get_proc_lineage(pid)
+    }
+
+    async fn lock_cores(&self, count: u32) -> u32 {
+        let mut core_state = self.core_state.lock().await;
+        core_state.lock_cores(count * self.maching_config.core_multiplier)
+    }
+
+    async fn lock_all_cores(&self) {
+        let mut core_state = self.core_state.lock().await;
+        core_state.lock_all_cores();
+    }
+
+    async fn unlock_cores(&self, count: u32) -> u32 {
+        let mut core_state = self.core_state.lock().await;
+        core_state.unlock_cores(count * self.maching_config.core_multiplier)
+    }
+
+    async fn unlock_all_cores(&self) {
+        let mut core_state = self.core_state.lock().await;
+        core_state.unlock_all_cores();
     }
 }
