@@ -340,7 +340,7 @@ impl RunningFrame {
                     if let Err(err) = self.finish(exit_code, exit_signal) {
                         warn!("Failed to mark frame {} as finished. {}", self, err);
                     }
-                    self.write_footer();
+                    logger.writeln(&self.write_footer());
                     Some(exit_code)
                 }
                 Err(err) => {
@@ -356,7 +356,7 @@ impl RunningFrame {
                     if let Err(err) = self.finish(exit_code, exit_signal) {
                         warn!("Failed to mark frame {} as finished. {}", self, err);
                     }
-                    self.write_footer();
+                    logger.writeln(&self.write_footer());
                     Some(exit_code)
                 }
                 Err(err) => {
@@ -1004,8 +1004,8 @@ ________________________________________________________________________________
     child_pid           {}
     cmdline             {}
     maxrss              {}
-                        "#,
-                                    child_stat.pid, child.cmdline, child_stat.rss
+    start_time          {}"#,
+                                    child_stat.pid, child.cmdline, child_stat.rss, child.start_time
                                 )
                             })
                             .join("\n")
@@ -1024,8 +1024,7 @@ maxrss              {maxrss}
 maxUsedGpuMemory    {max_gpu_memory}
 runTime             {run_time}
 
-Processes:
-{children}
+Processes:{children}
 ===================================================================================================="#
                 )
             }

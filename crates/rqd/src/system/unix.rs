@@ -6,14 +6,18 @@ use std::{
     path::Path,
     process::Command,
     sync::{Mutex, MutexGuard},
-    time::UNIX_EPOCH,
+    time::{Duration, UNIX_EPOCH},
 };
 
+use chrono::{DateTime, Local};
 use dashmap::DashMap;
 use itertools::Itertools;
 use miette::{IntoDiagnostic, Result, miette};
 use nix::sys::signal::{Signal, kill, killpg};
-use opencue_proto::host::HardwareState;
+use opencue_proto::{
+    host::HardwareState,
+    report::{ChildrenProcStats, ProcStats, Stat},
+};
 use sysinfo::{
     DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System,
 };
@@ -603,29 +607,57 @@ impl UnixSystem {
     /// * Virtual memory usage in bytes
     /// * GPU memory usage in bytes (currently always 0)
     /// * Proc runtime in seconds
+    /// * Vec of stats for all procs on the lineage
     /// * The updated mutex guard reference
     fn calculate_session_memory<'a>(
         &self,
         session_id: &u32,
         sysinfo: MutexGuard<'a, System>,
-    ) -> (u64, u64, u64, u64, MutexGuard<'a, System>) {
-        let (memory, virtual_memory, gpu_memory, run_time) = match self
-            .procs_lineage_cache
-            .get(session_id)
-        {
-            Some(ref lineage) => lineage
-                .iter()
-                .map(
-                    |pid| match sysinfo.process(Pid::from(pid.clone() as usize)) {
-                        Some(proc) => (proc.memory(), proc.virtual_memory(), proc.run_time(), 0),
-                        None => (0, 0, 0, 0),
-                    },
-                )
-                .reduce(|a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, std::cmp::max(a.3, b.3)))
-                .unwrap_or((0, 0, 0, 0)),
-            None => (0, 0, 0, 0),
-        };
-        (memory, virtual_memory, gpu_memory, run_time, sysinfo)
+    ) -> (u64, u64, u64, u64, Vec<ProcStats>, MutexGuard<'a, System>) {
+        let mut children = Vec::new();
+        let (memory, virtual_memory, gpu_memory, run_time) =
+            match self.procs_lineage_cache.get(session_id) {
+                Some(ref lineage) => lineage
+                    .iter()
+                    .map(
+                        |pid| match sysinfo.process(Pid::from(pid.clone() as usize)) {
+                            Some(proc) => {
+                                let start_time_str = DateTime::<Local>::from(
+                                    UNIX_EPOCH + Duration::from_secs(proc.start_time()),
+                                )
+                                .format("%Y-%m-%d %H:%M:%S")
+                                .to_string();
+                                children.push(ProcStats {
+                                    stat: Some(Stat {
+                                        rss: proc.memory() as i64,
+                                        vsize: proc.virtual_memory() as i64,
+                                        state: "".to_string(),
+                                        name: proc.name().to_string_lossy().to_string(),
+                                        pid: pid.to_string(),
+                                    }),
+                                    statm: None,
+                                    status: None,
+                                    // TODO: cmd() doesn't seem to return argv. Find a better option
+                                    cmdline: format!("{:?}", proc.cmd()),
+                                    start_time: start_time_str,
+                                });
+                                (proc.memory(), proc.virtual_memory(), 0, proc.run_time())
+                            }
+                            None => (0, 0, 0, 0),
+                        },
+                    )
+                    .reduce(|a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, std::cmp::max(a.3, b.3)))
+                    .unwrap_or((0, 0, 0, 0)),
+                None => (0, 0, 0, 0),
+            };
+        (
+            memory,
+            virtual_memory,
+            gpu_memory,
+            run_time,
+            children,
+            sysinfo,
+        )
     }
 
     /// Recursively calculates memory usage of a process and all of its child processes.
@@ -902,8 +934,14 @@ impl SystemManager for UnixSystem {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         if self.config.use_session_id_for_proc_lineage {
-            let (summed_memory, summed_virtual_memory, summed_gpu_memory, total_run_time, guard) =
-                self.calculate_session_memory(&pid, sysinfo);
+            let (
+                summed_memory,
+                summed_virtual_memory,
+                summed_gpu_memory,
+                total_run_time,
+                children,
+                guard,
+            ) = self.calculate_session_memory(&pid, sysinfo);
 
             debug!(
                 "Collect frame stats fo {}. rss: {}mb virtual: {}mb gpu: {}mb",
@@ -923,7 +961,7 @@ impl SystemManager for UnixSystem {
                     llu_time: log_mtime,
                     max_used_gpu_memory: 0,
                     used_gpu_memory: summed_gpu_memory,
-                    children: None,
+                    children: Some(ChildrenProcStats { children }),
                     epoch_start_time: proc.start_time(),
                     run_time: total_run_time,
                 }))
