@@ -1052,6 +1052,16 @@ impl SystemManager for UnixSystem {
             .get(&pid)
             .map(|lineage| lineage.clone())
     }
+
+    #[cfg(target_os = "linux")]
+    fn reboot(&self) {
+        nix::sys::reboot::reboot(nix::sys::reboot::RebootMode::RB_AUTOBOOT)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reboot(&self) {
+        _ = Command::new("reboot").status();
+    }
 }
 
 #[cfg(test)]

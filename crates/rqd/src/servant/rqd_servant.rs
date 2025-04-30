@@ -50,7 +50,7 @@ impl RqdServant {
 
 #[async_trait]
 impl RqdInterface for RqdServant {
-    /// Return the RunFrame by id
+    /// [Deprecated] Return the RunFrame by id
     async fn get_run_frame(
         &self,
         request: Request<RqdStaticGetRunFrameRequest>,
@@ -168,17 +168,26 @@ impl RqdInterface for RqdServant {
     /// Reboot the host when it becomes idle
     async fn reboot_idle(
         &self,
-        request: Request<RqdStaticRebootIdleRequest>,
+        _request: Request<RqdStaticRebootIdleRequest>,
     ) -> Result<Response<RqdStaticRebootIdleResponse>> {
-        todo!()
+        if let Err(err) = self.machine.reboot_if_idle().await {
+            Err(tonic::Status::aborted(format!(
+                "Failed to request reboot. {}",
+                err
+            )))?;
+        }
+        Ok(Response::new(RqdStaticRebootIdleResponse {}))
     }
 
-    /// Reboot the host now
+    /// [Deprecated] Reboot the host now
     async fn reboot_now(
         &self,
         request: Request<RqdStaticRebootNowRequest>,
     ) -> Result<Response<RqdStaticRebootNowResponse>> {
-        todo!()
+        todo!(
+            "Deprecated method not implemented by this interface {:?}",
+            request
+        )
     }
 
     /// Return the HostReport
@@ -194,7 +203,10 @@ impl RqdInterface for RqdServant {
         &self,
         request: Request<RqdStaticRestartIdleRequest>,
     ) -> Result<Response<RqdStaticRestartIdleResponse>> {
-        todo!()
+        todo!(
+            "Deprecated method not implemented by this interface {:?}",
+            request
+        )
     }
 
     /// [Deprecated] Restart rqd process now
@@ -202,15 +214,21 @@ impl RqdInterface for RqdServant {
         &self,
         request: Request<RqdStaticRestartNowRequest>,
     ) -> Result<Response<RqdStaticRestartNowResponse>> {
-        let _ = request;
-        todo!()
+        todo!(
+            "Deprecated method not implemented by this interface {:?}",
+            request
+        )
     }
-    /// Turn off rqd when it becomes idle
+
+    /// [Deprecated] Turn off rqd when it becomes idle
     async fn shutdown_rqd_idle(
         &self,
         request: Request<RqdStaticShutdownIdleRequest>,
     ) -> Result<Response<RqdStaticShutdownIdleResponse>> {
-        todo!()
+        todo!(
+            "Deprecated method not implemented by this interface {:?}",
+            request
+        )
     }
     /// Stop rqd now
     async fn shutdown_rqd_now(

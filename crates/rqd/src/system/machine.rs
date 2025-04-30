@@ -55,6 +55,7 @@ pub struct MachineMonitor {
     core_state: Arc<Mutex<CoreDetail>>,
     last_host_state: Arc<Mutex<Option<RenderHost>>>,
     interrupt: Mutex<Option<Sender<()>>>,
+    reboot_when_idle: Mutex<bool>,
 }
 
 impl MachineMonitor {
@@ -75,6 +76,7 @@ impl MachineMonitor {
             core_state: Arc::new(Mutex::new(CoreDetail::default())),
             last_host_state: Arc::new(Mutex::new(None)),
             interrupt: Mutex::new(None),
+            reboot_when_idle: Mutex::new(false),
         })
     }
 
@@ -129,6 +131,7 @@ impl MachineMonitor {
                 _ = interval.tick() => {
                     self.update_procs().await;
                     self.collect_and_send_host_report().await?;
+                    self.check_reboot_flag().await;
                 }
             }
         }
@@ -174,6 +177,13 @@ impl MachineMonitor {
             )
             .await?;
         Ok(())
+    }
+
+    async fn check_reboot_flag(&self) {
+        if *self.reboot_when_idle.lock().await {
+            warn!("Machine became idle. Rebooting..");
+            self.system_manager.lock().await.reboot();
+        }
     }
 
     async fn monitor_running_frames(&self) -> Result<()> {
@@ -399,6 +409,8 @@ pub trait Machine {
     async fn unlock_cores(&self, count: u32) -> u32;
 
     async fn unlock_all_cores(&self);
+
+    async fn reboot_if_idle(&self) -> Result<()>;
 }
 
 #[async_trait]
@@ -515,7 +527,7 @@ impl Machine for MachineMonitor {
         };
     }
 
-    async fn reserve_gpus(&self, num_gpus: u32) -> Result<Vec<u32>> {
+    async fn reserve_gpus(&self, _num_gpus: u32) -> Result<Vec<u32>> {
         todo!()
     }
 
@@ -569,5 +581,25 @@ impl Machine for MachineMonitor {
     async fn unlock_all_cores(&self) {
         let mut core_state = self.core_state.lock().await;
         core_state.unlock_all_cores();
+    }
+
+    async fn reboot_if_idle(&self) -> Result<()> {
+        // Prevent new frames from booking
+        self.lock_all_cores().await;
+
+        if self.running_frames_cache.len() > 0 {
+            // Schedule reboot if the machine is not idle
+            let mut reboot_when_idle = self.reboot_when_idle.lock().await;
+
+            warn!("Machine set to reboot when idle");
+            *reboot_when_idle = true;
+        } else {
+            // Reboot now
+            let system = self.system_manager.lock().await;
+
+            warn!("Rebooting machine on request");
+            system.reboot();
+        }
+        Ok(())
     }
 }
