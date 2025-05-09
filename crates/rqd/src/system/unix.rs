@@ -1054,7 +1054,7 @@ impl SystemManager for UnixSystem {
     }
 
     #[cfg(target_os = "linux")]
-    fn reboot(&self) {
+    fn reboot(&self) -> Result<()> {
         nix::sys::reboot::reboot(nix::sys::reboot::RebootMode::RB_AUTOBOOT)
             .map(|_| ())
             .into_diagnostic()
