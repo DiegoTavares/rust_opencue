@@ -75,7 +75,7 @@ pub trait SystemManager {
     fn get_proc_lineage(&self, pid: u32) -> Option<Vec<u32>>;
 
     /// Request a system reboot
-    fn reboot(&self);
+    fn reboot(&self) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Diagnostic, Error)]

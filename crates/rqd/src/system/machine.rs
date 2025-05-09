@@ -167,7 +167,9 @@ impl MachineMonitor {
     async fn check_reboot_flag(&self) {
         if *self.reboot_when_idle.lock().await {
             warn!("Machine became idle. Rebooting..");
-            self.system_manager.lock().await.reboot();
+            if let Err(err) = self.system_manager.lock().await.reboot() {
+                error!("Failed to reboot when became idle. {err}");
+            };
         }
     }
 
@@ -585,7 +587,7 @@ impl Machine for MachineMonitor {
             let system = self.system_manager.lock().await;
 
             warn!("Rebooting machine on request");
-            system.reboot();
+            system.reboot()?;
         }
         Ok(())
     }

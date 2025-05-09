@@ -12,7 +12,7 @@ use std::{
 use chrono::{DateTime, Local};
 use dashmap::DashMap;
 use itertools::Itertools;
-use miette::{IntoDiagnostic, Result, miette};
+use miette::{Context, IntoDiagnostic, Result, miette};
 use nix::sys::signal::{Signal, kill, killpg};
 use opencue_proto::{
     host::HardwareState,
@@ -1056,11 +1056,18 @@ impl SystemManager for UnixSystem {
     #[cfg(target_os = "linux")]
     fn reboot(&self) {
         nix::sys::reboot::reboot(nix::sys::reboot::RebootMode::RB_AUTOBOOT)
+            .map(|_| ())
+            .into_diagnostic()
+            .wrap_err("Failed to reboot")
     }
 
     #[cfg(target_os = "macos")]
-    fn reboot(&self) {
-        _ = Command::new("reboot").status();
+    fn reboot(&self) -> Result<()> {
+        Command::new("reboot")
+            .status()
+            .map(|_| ())
+            .into_diagnostic()
+            .wrap_err("Failed to reboot")
     }
 }
 
