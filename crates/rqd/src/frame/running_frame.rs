@@ -711,7 +711,7 @@ impl RunningFrame {
         );
 
         let _ = self.snapshot();
-        let handle = tokio::task::spawn(async move {
+        let log_watcher_handle = tokio::task::spawn(async move {
             while let Some(Ok(output)) = log_stream.next().await {
                 logger.write(output.into_bytes().as_ref());
             }
@@ -724,10 +724,7 @@ impl RunningFrame {
         if let Some(Ok(output)) = output_stream.take(1).next().await {
             (exit_code, exit_signal) = Self::interprete_output(Either::Right(output));
         }
-        handle
-            .await
-            .into_diagnostic()
-            .wrap_err("Failed to write log output. {}")?;
+        log_watcher_handle.abort();
 
         let msg = match exit_code {
             0 => format!("Frame {}(pid={}) finished successfully", self, pid),
