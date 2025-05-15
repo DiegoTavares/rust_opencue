@@ -21,14 +21,14 @@ struct BecomeUser {
 
 impl ToString for BecomeUser {
     fn to_string(&self) -> String {
-        let passwd = Uuid::new_v4();
+        let passwd = Uuid::new_v4().to_string();
         format!(
             r#"
 # Add and become user
-useradd -u {} -g {} -p {passwd} {}
+useradd -u {} -g {} -p {} {}
 su {}
 "#,
-            self.uid, self.gid, self.username, self.username
+            self.uid, self.gid, passwd, self.username, self.username
         )
     }
 }

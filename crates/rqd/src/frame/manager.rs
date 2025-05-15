@@ -227,16 +227,8 @@ impl FrameManager {
     async fn spawn_docker_frame(&self, running_frame: Arc<RunningFrame>, recovery_mode: bool) {
         self.frame_cache
             .insert_running_frame(Arc::clone(&running_frame));
-        let _thread_handle = tokio::task::spawn_blocking(move || {
-            let result =
-                std::panic::catch_unwind(async || running_frame.run_docker(recovery_mode).await);
-            if let Err(panic_info) = result {
-                _ = running_frame.finish(1, None);
-                error!(
-                    "Run thread panicked for {}: {:?}",
-                    running_frame, panic_info
-                );
-            }
+        let _thread_handle = tokio::task::spawn_blocking(async move || {
+            running_frame.run_docker(recovery_mode).await
         })
         .await;
     }

@@ -20,9 +20,9 @@ runner:
   force_kill_after_timeout: true
   docker.mounts:
     - target: ""
-    - source: ""
-    - typ: ""
-    - bind-propagation: ""
+      source: ""
+      typ: ""
+      bind-propagation: ""
   docker.images:
     rhel7: "centos7:latest"
     rocky9: "rockyimage:latest"

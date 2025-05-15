@@ -108,8 +108,8 @@ impl FrameLoggerT for FrameFileLogger {
             for c in bytes {
                 buff.push(c.clone());
                 if *c == linebreak {
-                    let timestamp = Utc::now().format("%H:%M:%S").to_string();
-                    buff.append(&mut timestamp.as_bytes().to_vec());
+                    let timestamp = format!("[{}] ", Utc::now().format("%H:%M:%S"));
+                    buff.extend_from_slice(timestamp.as_bytes());
                 }
             }
         } else {

@@ -616,18 +616,12 @@ impl RunningFrame {
             command.with_taskset(cpu_list.clone());
         }
 
-        command.with_become_user(
-            self.uid,
-            self.request.gid as u32,
-            self.request.user_name.clone(),
-        );
+        command.with_become_user(self.uid, self.gid, self.request.user_name.clone());
         let (_cmd, cmd_str) = command
             .with_frame_cmd(self.request.command.clone())
             .with_exit_file(self.exit_file_path.clone())
             .build()?;
         let entrypoint = Some(vec![
-            // Create a new session
-            "setsid &&".to_string(),
             // Execute entrypoint file
             self.entrypoint_file_path.clone(),
         ]);
@@ -641,28 +635,34 @@ impl RunningFrame {
             self.request.job_name, self.request.resource_id
         );
 
-        let _container = &docker.create_container(
-            Some(CreateContainerOptions {
-                name: container_name.clone(),
-                platform: None,
-            }),
-            container::Config::<String> {
-                hostname: Some(self.hostname.clone()),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                tty: Some(true),
-                env,
-                image,
-                working_dir,
-                entrypoint,
-                host_config: Some(host_config),
-                ..Default::default()
-            },
-        );
+        let _container = &docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: container_name.clone(),
+                    platform: None,
+                }),
+                container::Config::<String> {
+                    hostname: Some(self.hostname.clone()),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    tty: Some(true),
+                    env,
+                    image,
+                    working_dir,
+                    entrypoint,
+                    host_config: Some(host_config),
+                    ..Default::default()
+                },
+            )
+            .await
+            .into_diagnostic()
+            .wrap_err("Failed to create container")?;
+
         let _ = &docker
             .start_container(&container_name, None::<StartContainerOptions<String>>)
             .await
-            .into_diagnostic()?;
+            .into_diagnostic()
+            .wrap_err("Failed to start container")?;
 
         let AttachContainerResults {
             output: mut log_stream,
@@ -1239,7 +1239,7 @@ Environment Variables:
             start_time = "",
             command = self.request.command,
             uid = self.uid,
-            gid = self.request.gid,
+            gid = self.gid,
             log_path = self.log_path,
             hostname = self.hostname,
             job_id = self.job_id,
