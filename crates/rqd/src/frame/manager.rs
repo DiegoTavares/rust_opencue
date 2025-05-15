@@ -115,7 +115,7 @@ impl FrameManager {
         ));
 
         if self.config.runner.run_on_docker {
-            self.spawn_docker_frame(running_frame, false).await;
+            self.spawn_docker_frame(running_frame, false);
         } else {
             self.spawn_running_frame(running_frame, false);
         }
@@ -224,13 +224,12 @@ impl FrameManager {
         }
     }
 
-    async fn spawn_docker_frame(&self, running_frame: Arc<RunningFrame>, recovery_mode: bool) {
+    fn spawn_docker_frame(&self, running_frame: Arc<RunningFrame>, recovery_mode: bool) {
         self.frame_cache
             .insert_running_frame(Arc::clone(&running_frame));
         let _thread_handle = tokio::task::spawn_blocking(async move || {
             running_frame.run_docker(recovery_mode).await
-        })
-        .await;
+        });
     }
 
     fn validate_grpc_frame(&self, run_frame: &RunFrame) -> Result<(), FrameManagerError> {
