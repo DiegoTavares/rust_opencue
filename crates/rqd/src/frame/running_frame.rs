@@ -425,7 +425,7 @@ impl RunningFrame {
         let logger = Arc::new(logger_base.unwrap());
 
         let exit_code = if recover_mode {
-            match self.recover_docker_inner(Arc::clone(&logger)).await {
+            match self.recover_inner(Arc::clone(&logger)) {
                 Ok((exit_code, exit_signal)) => {
                     if let Err(err) = self.finish(exit_code, exit_signal) {
                         warn!("Failed to mark frame {} as finished. {}", self, err);
@@ -867,10 +867,6 @@ impl RunningFrame {
         // If a recovered frame fails to read the exit code from
         // the exit file, mark the frame as killed (SIGTERM)
         Ok(self.read_exit_file().unwrap_or((1, Some(143))))
-    }
-
-    async fn recover_docker_inner(&self, logger: FrameLogger) -> Result<(i32, Option<i32>)> {
-        todo!()
     }
 
     /// Get the process ID (PID) of the running frame process
