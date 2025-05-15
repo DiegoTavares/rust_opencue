@@ -41,7 +41,10 @@ use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, System};
 
 use miette::{Context, IntoDiagnostic, Result, miette};
-use opencue_proto::{report::RunningFrameInfo, rqd::RunFrame};
+use opencue_proto::{
+    report::{ChildrenProcStats, RunningFrameInfo},
+    rqd::RunFrame,
+};
 use uuid::Uuid;
 
 use super::logging::{FrameLogger, FrameLoggerBuilder};
@@ -1348,6 +1351,12 @@ Render Frame Completed
             .as_ref()
             .map(|stats| stats.epoch_start_time)
             .unwrap_or(0);
+
+        let children = frame_stats_lock
+            .as_ref()
+            .map(|stats| stats.children.clone())
+            .flatten();
+
         if let Some(ref stats) = *frame_stats_lock {
             Some(RunningFrameInfo {
                 resource_id: self.request.resource_id.clone(),
@@ -1367,8 +1376,7 @@ Render Frame Completed
                 num_gpus: self.request.num_gpus,
                 max_used_gpu_memory: stats.max_used_gpu_memory as i64,
                 used_gpu_memory: stats.used_gpu_memory as i64,
-                // Not recording proc children for now
-                children: None,
+                children,
             })
         } else {
             None
