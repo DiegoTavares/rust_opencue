@@ -206,6 +206,7 @@ impl MachineMonitor {
                 true
             }
         });
+        drop(system_monitor);
         self.handle_finished_frames(finished_frames).await;
         Ok(())
     }
