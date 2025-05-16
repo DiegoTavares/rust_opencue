@@ -215,51 +215,62 @@ impl MachineMonitor {
     }
 
     async fn handle_finished_frames(&self, finished_frames: Vec<Arc<RunningFrame>>) {
+        if finished_frames.is_empty() {
+            return;
+        }
+
         let host_state_lock = self.last_host_state.lock().await;
         let host_state = host_state_lock.clone();
         // Avoid holding a lock while reporting back to cuebot
         drop(host_state_lock);
 
-        if let Some(host_state) = host_state {
-            for frame in finished_frames {
-                if let (Some(finished_state), Some(frame_report)) =
-                    (frame.get_finished_state(), frame.into_running_frame_info())
-                {
-                    let exit_signal = match finished_state.exit_signal {
-                        Some(signal) => signal as u32,
-                        None => 0,
-                    };
-
-                    // Release resources
-                    if let Some(procs) = &frame.cpu_list {
-                        self.release_cpus(procs).await;
-                    } else {
-                        self.release_cores(
-                            frame.request.num_cores as u32 / self.maching_config.core_multiplier,
-                        )
-                        .await;
-                    }
-
-                    // Send complete report
-                    if let Err(err) = self
-                        .report_client
-                        .send_frame_complete_report(
-                            host_state.clone(),
-                            frame_report,
-                            finished_state.exit_code as u32,
-                            exit_signal,
-                            0,
-                        )
-                        .await
+        match host_state {
+            Some(host_state) => {
+                for frame in finished_frames {
+                    if let (Some(finished_state), Some(frame_report)) =
+                        (frame.get_finished_state(), frame.into_running_frame_info())
                     {
-                        error!(
-                            "Failed to send frame_complete_report for {}. {}",
-                            frame, err
-                        );
-                    };
-                } else {
-                    warn!("Invalid state on supposedly finished frame. {}", frame);
+                        let exit_signal = match finished_state.exit_signal {
+                            Some(signal) => signal as u32,
+                            None => 0,
+                        };
+                        debug!("Sending frame complete report: {}", frame);
+
+                        // Release resources
+                        if let Some(procs) = &frame.cpu_list {
+                            self.release_cpus(procs).await;
+                        } else {
+                            self.release_cores(
+                                frame.request.num_cores as u32
+                                    / self.maching_config.core_multiplier,
+                            )
+                            .await;
+                        }
+
+                        // Send complete report
+                        if let Err(err) = self
+                            .report_client
+                            .send_frame_complete_report(
+                                host_state.clone(),
+                                frame_report,
+                                finished_state.exit_code as u32,
+                                exit_signal,
+                                0,
+                            )
+                            .await
+                        {
+                            error!(
+                                "Failed to send frame_complete_report for {}. {}",
+                                frame, err
+                            );
+                        };
+                    } else {
+                        warn!("Invalid state on supposedly finished frame. {}", frame);
+                    }
                 }
+            }
+            None => {
+                warn!("Invalid state. Could not find host state");
             }
         }
     }
