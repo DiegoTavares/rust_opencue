@@ -191,11 +191,7 @@ impl MachineMonitor {
                     })
                 {
                     if let Ok(mut frame_stats) = running_frame.frame_stats.write() {
-                        if let Some(old_frame_stats) = frame_stats.as_mut() {
-                            old_frame_stats.update(proc_stats);
-                        } else {
-                            *frame_stats = Some(proc_stats);
-                        }
+                        frame_stats.update(proc_stats);
                     }
                     true
                 } else {
@@ -227,9 +223,8 @@ impl MachineMonitor {
         match host_state {
             Some(host_state) => {
                 for frame in finished_frames {
-                    if let (Some(finished_state), Some(frame_report)) =
-                        (frame.get_finished_state(), frame.into_running_frame_info())
-                    {
+                    if let Some(finished_state) = frame.get_finished_state() {
+                        let frame_report = frame.into_running_frame_info();
                         let exit_signal = match finished_state.exit_signal {
                             Some(signal) => signal as u32,
                             None => 0,
