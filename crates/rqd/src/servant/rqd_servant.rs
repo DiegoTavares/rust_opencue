@@ -245,7 +245,7 @@ impl RqdInterface for RqdServant {
         &self,
         request: Request<RqdStaticShutdownNowRequest>,
     ) -> Result<Response<RqdStaticShutdownNowResponse>> {
-        todo!()
+        self.machine
     }
 
     /// Unlock a number of cores
