@@ -236,11 +236,13 @@ impl MachineMonitor {
                         if let Some(procs) = &frame.cpu_list {
                             self.release_cpus(procs).await;
                         } else {
-                            self.release_cores(
-                                frame.request.num_cores as u32
-                                    / self.maching_config.core_multiplier,
-                            )
-                            .await;
+                            // Ensure the division rounds up if num_cores is not a multiple of
+                            // core_multiplier
+                            let num_cores_to_release = (frame.request.num_cores as u32
+                                + self.maching_config.core_multiplier
+                                - 1)
+                                / self.maching_config.core_multiplier;
+                            self.release_cores(num_cores_to_release).await;
                         }
 
                         // Send complete report
