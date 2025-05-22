@@ -20,6 +20,7 @@ use opencue_proto::{
 };
 use sysinfo::{
     DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System,
+    UpdateKind,
 };
 use tracing::debug;
 use uuid::Uuid;
@@ -592,8 +593,10 @@ impl UnixSystem {
                                 )
                                 .format("%Y-%m-%d %H:%M:%S")
                                 .to_string();
-                                let proc_memory = proc.memory() / 1024 / 1024;
-                                let proc_vmemory = proc.virtual_memory() / 1024 / 1024;
+                                let proc_memory = proc.memory() / 1024;
+                                let proc_vmemory = proc.virtual_memory() / 1024;
+                                let cmdline =
+                                    proc.cmd().iter().map(|oss| oss.to_string_lossy()).join(" ");
                                 children.push(ProcStats {
                                     stat: Some(Stat {
                                         rss: proc_memory as i64,
@@ -604,8 +607,7 @@ impl UnixSystem {
                                     }),
                                     statm: None,
                                     status: None,
-                                    // TODO: cmd() doesn't seem to return argv. Find a better option
-                                    cmdline: format!("{:?}", proc.cmd()),
+                                    cmdline,
                                     start_time: start_time_str,
                                 });
                                 (proc_memory, proc_vmemory, 0, proc.run_time())
@@ -841,7 +843,11 @@ impl SystemManager for UnixSystem {
             .unwrap_or_else(|err| err.into_inner());
 
         *sysinfo = sysinfo::System::new_with_specifics(
-            RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
+            RefreshKind::nothing().with_processes(
+                ProcessRefreshKind::nothing()
+                    .with_memory()
+                    .with_cmd(UpdateKind::Always),
+            ),
         );
         drop(sysinfo);
         self.refresh_procs_cache();
