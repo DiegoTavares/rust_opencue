@@ -71,6 +71,7 @@ pub struct RunningFrame {
     pub exit_file_path: String,
     pub entrypoint_file_path: String,
     state: Mutex<FrameState>,
+    pub remove_from_cache: RwLock<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -190,6 +191,7 @@ impl RunningFrame {
             state: Mutex::new(FrameState::Created(CreatedState {
                 launch_thread_handle: None,
             })),
+            remove_from_cache: RwLock::new(false),
         }
     }
 
@@ -1364,6 +1366,14 @@ Render Frame Completed
             used_gpu_memory: stats.used_gpu_memory as i64,
             children,
         }
+    }
+
+    pub fn mark_for_cache_removal(&self) {
+        let mut lock = self
+            .remove_from_cache
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *lock = true;
     }
 }
 

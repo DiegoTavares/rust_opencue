@@ -180,6 +180,9 @@ impl MachineMonitor {
         self.running_frames_cache.retain(|_, running_frame| {
             // A frame that hasn't properly started will not have a pid
             if let Some(pid) = running_frame.pid() {
+                let marked_for_removal = {
+                    *running_frame.remove_from_cache.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+                };
                 if running_frame.is_finished() {
                     finished_frames.push(Arc::clone(running_frame));
                     false
@@ -194,13 +197,21 @@ impl MachineMonitor {
                         frame_stats.update(proc_stats);
                     }
                     true
-                } else {
+                } else if marked_for_removal {
                     warn!(
                         "Removing {} from the cache. Could not find proc {} for frame that was supposed to be running.",
                         running_frame.to_string(),
                         pid
                     );
+                    // Attempt to finish the process
+                    let _ = running_frame.finish(1, Some(19));
+                    finished_frames.push(Arc::clone(running_frame));
                     false
+                } else {
+                    // Proc finished but frame is waiting for the lock on `is_finished` to update the status
+                    // keep frame around for another round
+                    running_frame.mark_for_cache_removal();
+                    true
                 }
             } else {
                 true
@@ -230,7 +241,7 @@ impl MachineMonitor {
                             Some(signal) => signal as u32,
                             None => 0,
                         };
-                        debug!("Sending frame complete report: {}", frame);
+                        info!("Sending frame complete report: {}", frame);
 
                         // Release resources
                         if let Some(procs) = &frame.cpu_list {
