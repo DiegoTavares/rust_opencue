@@ -140,32 +140,24 @@ impl RunningFrame {
             .join(format!("{}.{}.rqlog", request.job_name, request.frame_name))
             .to_string_lossy()
             .to_string();
+        let frame_file_prefix = format!(
+            "{}.{}.{}",
+            request.job_name, request.frame_name, resource_id
+        );
         let raw_stdout_path = std::path::Path::new(&request.log_dir)
-            .join(format!(
-                "{}.{}.{}.raw_stdout.rqlog",
-                request.job_name, request.frame_name, resource_id
-            ))
+            .join(format!("{}.raw_stdout.rqlog", frame_file_prefix))
             .to_string_lossy()
             .to_string();
         let raw_stderr_path = std::path::Path::new(&request.log_dir)
-            .join(format!(
-                "{}.{}.{}.raw_stderr.rqlog",
-                request.job_name, request.frame_name, resource_id
-            ))
+            .join(format!("{}.raw_stderr.rqlog", frame_file_prefix))
             .to_string_lossy()
             .to_string();
         let exit_file_path = std::path::Path::new(&request.log_dir)
-            .join(format!(
-                "{}.{}.{}.exit_status",
-                request.job_name, request.frame_name, resource_id
-            ))
+            .join(format!("{}.exit_status", frame_file_prefix))
             .to_string_lossy()
             .to_string();
         let entrypoint_file_path = std::path::Path::new(&request.log_dir)
-            .join(format!(
-                "{}.{}.{}.sh",
-                request.job_name, request.frame_name, resource_id
-            ))
+            .join(format!("{}.sh", frame_file_prefix))
             .to_string_lossy()
             .to_string();
         let env_vars = Self::setup_env_vars(&config, &request, hostname.clone(), log_path.clone());
@@ -352,8 +344,12 @@ impl RunningFrame {
     /// If the process fails to spawn, it logs the error but doesn't set an exit code.
     /// The method handles both successful and failed execution scenarios.
     pub fn run(&self, recover_mode: bool) {
-        let logger_base =
-            FrameLoggerBuilder::from_logger_config(self.log_path.clone(), &self.config);
+        let logger_base = FrameLoggerBuilder::from_logger_config(
+            self.log_path.clone(),
+            &self.config,
+            self.uid,
+            self.gid,
+        );
         if let Err(_) = logger_base {
             error!("Failed to create log stream for {}", self.log_path);
             return;
@@ -416,8 +412,12 @@ impl RunningFrame {
     /// If the process fails to spawn, it logs the error but doesn't set an exit code.
     /// The method handles both successful and failed execution scenarios.
     pub async fn run_docker(&self, recover_mode: bool) {
-        let logger_base =
-            FrameLoggerBuilder::from_logger_config(self.log_path.clone(), &self.config);
+        let logger_base = FrameLoggerBuilder::from_logger_config(
+            self.log_path.clone(),
+            &self.config,
+            self.uid,
+            self.gid,
+        );
         if let Err(_) = logger_base {
             error!("Failed to create log stream for {}", self.log_path);
             return;
@@ -1082,10 +1082,9 @@ impl RunningFrame {
     }
 
     fn snapshot_path(&self) -> Result<String> {
-        let pid = self.pid().ok_or_else(|| {
-            warn!("Failed to snapshot frame {}. No pid available", self);
-            miette!("No pid available for frame snapshot")
-        })?;
+        let pid = self
+            .pid()
+            .ok_or_else(|| miette!("No pid available for frame snapshot"))?;
 
         Ok(format!(
             "{}/snapshot_{}-{}-{}.bin",
