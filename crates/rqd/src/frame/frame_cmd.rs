@@ -89,7 +89,7 @@ trap 'handle_signal HUP' SIGHUP
 {}
 
 # Start the command and get its PID
-eval "{}"
+eval '{}'
 exit_code=$?
 command_pid=$!
 
