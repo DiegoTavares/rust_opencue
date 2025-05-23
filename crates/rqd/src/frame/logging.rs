@@ -30,7 +30,7 @@ impl FrameLoggerBuilder {
     ) -> Result<Arc<dyn FrameLoggerT + Send + Sync + 'static>> {
         match logger_config.logger {
             LoggerType::File => {
-                FrameFileLogger::init(path, logger_config.prepend_timestamp, uid, gid)
+                FrameFileLogger::init(path, logger_config.prepend_timestamp, Some((uid, gid)))
                     .map(|a| Arc::new(a) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
             }
         }
@@ -44,19 +44,27 @@ pub struct FrameFileLogger {
 }
 
 impl FrameFileLogger {
-    pub fn init(path: String, prepend_timestamp: bool, uid: u32, gid: u32) -> Result<Self> {
+    pub fn init(
+        path: String,
+        prepend_timestamp: bool,
+        uid_gid: Option<(u32, u32)>,
+    ) -> Result<Self> {
         let log_path = Path::new(path.as_str());
         if log_path.exists() {
             Self::rotate_existing_files(&path)?;
         } else if let Some(parent_path) = log_path.parent() {
             if !parent_path.exists() {
                 fs::create_dir_all(parent_path).into_diagnostic()?;
-                Self::change_ownership(parent_path, uid, gid)?;
+                if let Some((uid, gid)) = uid_gid {
+                    Self::change_ownership(parent_path, uid, gid)?;
+                }
             }
         }
 
         let file = File::create(log_path).into_diagnostic()?;
-        Self::change_ownership(log_path, uid, gid)?;
+        if let Some((uid, gid)) = uid_gid {
+            Self::change_ownership(log_path, uid, gid)?;
+        }
         let file_descriptor = Mutex::new(file);
         Ok(FrameFileLogger {
             _path: path,
@@ -211,7 +219,7 @@ mod tests {
         let temp_path = temp_file.path().to_string_lossy().to_string();
 
         // Create logger with timestamp disabled
-        let logger = FrameFileLogger::init(temp_path.clone(), false, 10, 10).unwrap();
+        let logger = FrameFileLogger::init(temp_path.clone(), false, None).unwrap();
 
         // Write some test content
         let test_content = b"Test content";
@@ -232,7 +240,7 @@ mod tests {
         let temp_path = temp_file.path().to_string_lossy().to_string();
 
         // Create logger with timestamp enabled
-        let logger = FrameFileLogger::init(temp_path.clone(), true, 10, 10).unwrap();
+        let logger = FrameFileLogger::init(temp_path.clone(), true, None).unwrap();
 
         // Write content with newlines to test timestamp prepending
         let test_content = b"Line 1\nLine 2\nLine 3";
@@ -260,7 +268,7 @@ mod tests {
         let temp_path = temp_file.path().to_string_lossy().to_string();
 
         // Create logger with timestamp disabled
-        let logger = FrameFileLogger::init(temp_path.clone(), false, 10, 10).unwrap();
+        let logger = FrameFileLogger::init(temp_path.clone(), false, None).unwrap();
 
         // Write binary data
         let binary_data = [0u8, 1u8, 2u8, 3u8, 4u8, 255u8];
@@ -281,7 +289,7 @@ mod tests {
         let temp_path = temp_file.path().to_string_lossy().to_string();
 
         // Create logger with timestamp disabled for simplicity
-        let logger = FrameFileLogger::init(temp_path.clone(), false, 10, 10).unwrap();
+        let logger = FrameFileLogger::init(temp_path.clone(), false, None).unwrap();
 
         // Write multiple times
         logger.write(b"First write. ");
@@ -303,7 +311,7 @@ mod tests {
         let temp_path = temp_file.path().to_string_lossy().to_string();
 
         // Create logger with timestamp disabled
-        let logger = FrameFileLogger::init(temp_path.clone(), false, 10, 10).unwrap();
+        let logger = FrameFileLogger::init(temp_path.clone(), false, None).unwrap();
 
         // Write empty content
         logger.write(b"");
