@@ -1213,8 +1213,10 @@ impl RunningFrame {
             ),
             None => "Hyperthreading disabled".to_string(),
         };
+
         format!(
             r#"
+
 ====================================================================================================
 RenderQ JobSpec     {start_time}
 command             {command}
