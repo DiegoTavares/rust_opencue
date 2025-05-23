@@ -22,7 +22,7 @@ use sysinfo::{
     DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System,
     UpdateKind,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::config::config::MachineConfig;
@@ -137,7 +137,6 @@ impl UnixSystem {
             ]),
             cpu_stat: CpuStat {
                 reserved_cores_by_physid: HashMap::new(),
-                available_cores: available_core_count,
             },
             sysinfo_system: Mutex::new(sysinfo::System::new()),
             procs_lineage_cache: DashMap::new(),
@@ -486,15 +485,11 @@ impl UnixSystem {
         core_id: u32,
         reserver_id: Uuid,
     ) -> Result<(), ReservationError> {
-        if self.cpu_stat.available_cores <= 0 {
-            Err(ReservationError::NotEnoughResourcesAvailable)?
-        }
         self.cpu_stat
             .reserved_cores_by_physid
             .entry(phys_id)
             .or_insert_with(|| CoreReservation::new(reserver_id))
             .insert(core_id);
-        self.cpu_stat.available_cores -= 1;
         Ok(())
     }
 
@@ -683,9 +678,6 @@ impl SystemManager for UnixSystem {
     }
 
     fn release_core(&mut self, core_id: &u32) -> Result<(), ReservationError> {
-        if self.cpu_stat.available_cores <= 0 {
-            Err(ReservationError::NotEnoughResourcesAvailable)?
-        }
         self.cpu_stat
             .reserved_cores_by_physid
             .iter_mut()
@@ -694,10 +686,6 @@ impl SystemManager for UnixSystem {
     }
 
     fn reserve_cores(&mut self, count: u32, frame_id: Uuid) -> Result<Vec<u32>, ReservationError> {
-        if count > self.cpu_stat.available_cores {
-            Err(ReservationError::NotEnoughResourcesAvailable)?
-        }
-
         let mut selected_cores = Vec::with_capacity(count as usize);
         let available_cores = self.calculate_available_cores()?;
 
@@ -714,15 +702,12 @@ impl SystemManager for UnixSystem {
             selected_cores.push(core_id);
         }
 
-        // Not having all cores reserved at this point is an unconsistent state, as it has been
-        // initially checked if the system had enough cores for this reservation
-        assert_eq!(
-            count,
-            selected_cores.len() as u32,
-            "Not having all cores reserved at this point is an unconsistent state, as we haves
-            initially checked if there are cores availabLe for this reservation"
-        );
         if count != selected_cores.len() as u32 {
+            for core_id in &selected_cores {
+                if let Err(err) = self.release_core(core_id) {
+                    warn!("Failed to release core: {err}");
+                }
+            }
             Err(ReservationError::NotEnoughResourcesAvailable)?
         }
 
@@ -1154,7 +1139,13 @@ mod tests {
             assert!(result.is_ok());
             let reserved = result.unwrap();
             assert_eq!(reserved.len(), 2);
-            assert_eq!(system.cpu_stat.available_cores, 2);
+            let available_cores = system
+                .calculate_available_cores()
+                .unwrap_or(Vec::new())
+                .iter()
+                .map(|(_physid, cores)| cores.len())
+                .sum::<usize>();
+            assert_eq!(available_cores, 2);
         }
 
         #[test]
@@ -1167,7 +1158,13 @@ mod tests {
                 result,
                 Err(ReservationError::NotEnoughResourcesAvailable)
             ));
-            assert_eq!(system.cpu_stat.available_cores, 4); // Should remain unchanged
+            let available_cores = system
+                .calculate_available_cores()
+                .unwrap_or(Vec::new())
+                .iter()
+                .map(|(_physid, cores)| cores.len())
+                .sum::<usize>();
+            assert_eq!(available_cores, 4); // Should remain unchanged
         }
 
         #[test]
@@ -1179,7 +1176,13 @@ mod tests {
             assert!(result.is_ok());
             let reserved = result.unwrap();
             assert_eq!(reserved.len(), 4);
-            assert_eq!(system.cpu_stat.available_cores, 0);
+            let available_cores = system
+                .calculate_available_cores()
+                .unwrap_or(Vec::new())
+                .iter()
+                .map(|(_physid, cores)| cores.len())
+                .sum::<usize>();
+            assert_eq!(available_cores, 0);
         }
 
         #[test]
@@ -1212,12 +1215,24 @@ mod tests {
             // First reservation
             let result1 = system.reserve_cores(2, Uuid::new_v4());
             assert!(result1.is_ok());
-            assert_eq!(system.cpu_stat.available_cores, 2);
+            let available_cores = system
+                .calculate_available_cores()
+                .unwrap_or(Vec::new())
+                .iter()
+                .map(|(_physid, cores)| cores.len())
+                .sum::<usize>();
+            assert_eq!(available_cores, 2);
 
             // Second reservation
             let result2 = system.reserve_cores(1, Uuid::new_v4());
             assert!(result2.is_ok());
-            assert_eq!(system.cpu_stat.available_cores, 1);
+            let available_cores = system
+                .calculate_available_cores()
+                .unwrap_or(Vec::new())
+                .iter()
+                .map(|(_physid, cores)| cores.len())
+                .sum::<usize>();
+            assert_eq!(available_cores, 1);
 
             // Third reservation - should fail
             let result3 = system.reserve_cores(2, Uuid::new_v4());
@@ -1250,7 +1265,6 @@ mod tests {
                 physid_and_coreid_by_procid,
                 cpu_stat: CpuStat {
                     reserved_cores_by_physid: HashMap::new(),
-                    available_cores: total_cores,
                 },
                 static_info: MachineStaticInfo {
                     hostname: "test".to_string(),

@@ -91,7 +91,7 @@ pub enum ReservationError {
 pub struct CpuStat {
     /// List of cores currently reserved
     pub reserved_cores_by_physid: HashMap<u32, CoreReservation>,
-    pub available_cores: u32,
+    // pub available_cores: u32,
 }
 
 #[derive(Debug, Clone)]
