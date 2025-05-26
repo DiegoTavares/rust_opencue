@@ -79,7 +79,7 @@ impl FrameFileLogger {
 
         use miette::Context;
 
-        fs::set_permissions(path, Permissions::from_mode(0o777))
+        fs::set_permissions(path, Permissions::from_mode(0o775))
             .into_diagnostic()
             .wrap_err("Failed to change log dir permissions: {path}")?;
 
@@ -89,7 +89,7 @@ impl FrameFileLogger {
     }
 
     #[cfg(target_os = "windows")]
-    fn change_ownership(path: String, uid: u32, gid: u32) -> Result<()> {
+    fn change_ownership(_path: &String, _uid: u32, _gid: u32) -> Result<()> {
         Ok(())
     }
 
