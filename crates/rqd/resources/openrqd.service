@@ -12,6 +12,8 @@ StandardOutput=journal+console
 StandardError=journal+console
 SyslogIdentifier=openrqd
 TimeoutSec=5
+Restart=on-failure
+RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
