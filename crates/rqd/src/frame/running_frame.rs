@@ -136,15 +136,14 @@ impl RunningFrame {
         let job_id = request.job_id();
         let frame_id = request.frame_id();
         let layer_id = request.layer_id();
-        let resource_id = request.resource_id();
+        // Use a random id as part of the file prefix to prevent multiple frames from
+        // sharing the same control files
+        let random_id = Uuid::new_v4();
         let log_path = Path::new(&request.log_dir)
             .join(format!("{}.{}.rqlog", request.job_name, request.frame_name))
             .to_string_lossy()
             .to_string();
-        let frame_file_prefix = format!(
-            "{}.{}.{}",
-            request.job_name, request.frame_name, resource_id
-        );
+        let frame_file_prefix = format!("{}.{}", request.frame_name, &random_id.to_string()[0..7]);
         let raw_stdout_path = std::path::Path::new(&request.log_dir)
             .join(format!("{}.raw_stdout.rqlog", frame_file_prefix))
             .to_string_lossy()
