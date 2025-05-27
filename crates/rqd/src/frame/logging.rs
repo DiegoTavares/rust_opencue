@@ -1,5 +1,5 @@
 use crate::config::config::{LoggerType, RunnerConfig};
-use chrono::Utc;
+use chrono::{DateTime, Local};
 use miette::{IntoDiagnostic, Result};
 use std::{
     fs::{self, File, Permissions},
@@ -7,6 +7,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::Path,
     sync::{Arc, Mutex},
+    time::SystemTime,
 };
 use tracing::error;
 
@@ -111,7 +112,8 @@ impl FrameLoggerT for FrameFileLogger {
     fn writeln(&self, text: &str) {
         let mut line = String::with_capacity(text.len() + 8);
         if self.prepend_timestamp {
-            let timestamp = Utc::now().format("%H:%M:%S").to_string();
+            let time_str: DateTime<Local> = SystemTime::now().into();
+            let timestamp = time_str.format("%H:%M:%S").to_string();
             line.push('[');
             line.push_str(timestamp.as_str());
             line.push_str("] ");
@@ -139,7 +141,8 @@ impl FrameLoggerT for FrameFileLogger {
             for c in bytes {
                 buff.push(c.clone());
                 if *c == linebreak {
-                    let timestamp = format!("[{}] ", Utc::now().format("%H:%M:%S"));
+                    let time_str: DateTime<Local> = SystemTime::now().into();
+                    let timestamp = time_str.format("%H:%M:%S").to_string();
                     buff.extend_from_slice(timestamp.as_bytes());
                 }
             }
