@@ -51,15 +51,12 @@ pub struct UnixSystem {
 #[derive(Debug)]
 struct ProcessorInfoData {
     hyperthreading_multiplier: u32,
-    num_procs: u32,
     num_sockets: u32,
-    cores_per_proc: u32,
+    cores_per_socket: u32,
 }
 
 struct MachineStaticInfo {
     pub hostname: String,
-    /// Number of proc units (also known as virtual cores)
-    pub num_procs: u32,
     pub total_memory: u64,
     pub total_swap: u64,
     /// Number of sockets (also know as physical cores)
@@ -104,23 +101,16 @@ impl UnixSystem {
         let total_memory = sysinfo.total_memory();
         let total_swap = sysinfo.total_swap();
 
-        let available_core_count = procid_by_physid_and_core_id
-            .values()
-            .map(|sockets| sockets.iter().count())
-            .reduce(|a, b| a + b)
-            .unwrap_or(0) as u32;
-
         Ok(Self {
             config: config.clone(),
             procid_by_physid_and_core_id,
             physid_and_coreid_by_procid,
             static_info: MachineStaticInfo {
                 hostname: Self::get_hostname(config.use_ip_as_hostname)?,
-                num_procs: processor_info.num_procs,
                 total_memory,
                 total_swap,
                 num_sockets: processor_info.num_sockets,
-                cores_per_proc: processor_info.cores_per_proc,
+                cores_per_proc: processor_info.cores_per_socket,
                 hyperthreading_multiplier: processor_info.hyperthreading_multiplier,
                 boot_time: Self::read_boot_time(&config.proc_stat_path).unwrap_or(0),
                 tags: Self::setup_tags(&config),
@@ -172,7 +162,7 @@ impl UnixSystem {
         let cpuinfo = File::open(cpuinfo_path).into_diagnostic()?;
         let reader = BufReader::new(cpuinfo);
 
-        let mut num_procs = 0;
+        let mut num_threads = 0;
         let mut num_sockets = 0;
         let mut hyperthreading_multiplier: Option<u32> = None;
         let mut curr_core_map: HashMap<String, String> = HashMap::new();
@@ -206,7 +196,7 @@ impl UnixSystem {
                     .parse()
                     .unwrap_or(1);
                 hyperthreading_multiplier.replace(siblings / cpu_cores);
-                num_procs += 1;
+                num_threads += 1;
 
                 let core_id_opt = curr_core_map.get("core id");
                 if let (Ok(core_id), Ok(phys_id), Some(Ok(proc_id))) = (
@@ -243,16 +233,15 @@ impl UnixSystem {
         }
         // Apply modifier
         let hyper_modifier = hyperthreading_multiplier.unwrap_or(1);
-        num_procs = num_procs / hyper_modifier;
+        num_threads = num_threads / hyper_modifier;
         if num_sockets == 0 {
             Err(miette!("Invalid CPU with no sockets (physical id)"))
         } else {
             Ok((
                 ProcessorInfoData {
                     hyperthreading_multiplier: hyper_modifier,
-                    num_procs,
                     num_sockets,
-                    cores_per_proc: num_procs / num_sockets,
+                    cores_per_socket: num_threads / num_sockets,
                 },
                 procid_by_physid_and_core_id,
                 physid_and_coreid_by_procid,
@@ -630,7 +619,7 @@ impl SystemManager for UnixSystem {
         let dinamic_stat = self.read_dynamic_stat()?;
         Ok(MachineStat {
             hostname: self.static_info.hostname.clone(),
-            num_procs: self.static_info.num_procs,
+            num_procs: self.static_info.num_sockets,
             total_memory: self.static_info.total_memory,
             total_swap: self.static_info.total_swap,
             num_sockets: self.static_info.num_sockets,
@@ -915,7 +904,6 @@ mod tests {
         let linux_monitor = UnixSystem::init(&config)
             .expect("Initializing LinuxMachineStat failed")
             .static_info;
-        assert_eq!(4, linux_monitor.num_procs);
         assert_eq!(2, linux_monitor.num_sockets);
         assert_eq!(2, linux_monitor.cores_per_proc);
         assert_eq!(1, linux_monitor.hyperthreading_multiplier);
@@ -1004,10 +992,9 @@ mod tests {
                 found_mapping,
                 "No mappings found between processor IDs and physical/core IDs"
             );
-            assert_eq!(expected_procs, cpuinfo.num_procs, "Assert num_procs");
             assert_eq!(expected_sockets, cpuinfo.num_sockets, "Assert num_sockets");
             assert_eq!(
-                expected_cores_per_proc, cpuinfo.cores_per_proc,
+                expected_cores_per_proc, cpuinfo.cores_per_socket,
                 "Assert cores_per_proc"
             );
             assert_eq!(
@@ -1034,7 +1021,6 @@ mod tests {
         let static_info = stat.static_info;
 
         // Proc
-        assert_eq!(4, static_info.num_procs);
         assert_eq!(2, static_info.num_sockets);
         assert_eq!(2, static_info.cores_per_proc);
         assert_eq!(1, static_info.hyperthreading_multiplier);
@@ -1268,7 +1254,6 @@ mod tests {
                 },
                 static_info: MachineStaticInfo {
                     hostname: "test".to_string(),
-                    num_procs: total_cores,
                     total_memory: 0,
                     total_swap: 0,
                     num_sockets: physical_cpus,
