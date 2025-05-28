@@ -20,7 +20,10 @@ use uuid::Uuid;
 
 use crate::{
     config::config::{Config, MachineConfig},
-    frame::{cache::RunningFrameCache, running_frame::RunningFrame},
+    frame::{
+        cache::RunningFrameCache,
+        running_frame::{FrameState, RunningFrame},
+    },
     report::report_client::{ReportClient, ReportInterface},
 };
 
@@ -178,45 +181,56 @@ impl MachineMonitor {
         let mut finished_frames: Vec<Arc<RunningFrame>> = Vec::new();
 
         self.running_frames_cache.retain(|_, running_frame| {
-            // A frame that hasn't properly started will not have a pid
-            if let Some(pid) = running_frame.pid() {
-                let marked_for_removal = {
-                    *running_frame.remove_from_cache.read().unwrap_or_else(|poisoned| poisoned.into_inner())
-                };
-                if running_frame.is_finished() {
-                    finished_frames.push(Arc::clone(running_frame));
-                    false
-                } else if let Some(proc_stats) = system_monitor
-                    .collect_proc_stats(pid, running_frame.log_path.clone())
-                    .unwrap_or_else(|err| {
-                        warn!("Failed to collect proc_stats. {}", err);
-                        None
-                    })
-                {
-                    if let Ok(mut frame_stats) = running_frame.frame_stats.write() {
-                        frame_stats.update(proc_stats);
+            let marked_for_removal = {
+                *running_frame
+                    .remove_from_cache
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            };
+
+            match running_frame.get_state_copy() {
+                FrameState::Created(_) => true,
+                FrameState::Running(running_state) => {
+                    let proc_stats_opt = system_monitor
+                        .collect_proc_stats(running_state.pid, running_frame.log_path.clone())
+                        .unwrap_or_else(|err| {
+                            warn!("Failed to collect proc_stats. {}", err);
+                            None
+                        });
+                    if let Some(proc_stats) = proc_stats_opt {
+                        // Update stats for running frames
+                        if let Ok(mut frame_stats) = running_frame.frame_stats.write() {
+                            frame_stats.update(proc_stats);
+                        }
+                        true
+                    } else if marked_for_removal {
+                        warn!(
+                            "Removing {} from the cache. Could not find proc {} for frame that was supposed to be running.",
+                            running_frame.to_string(),
+                            running_state.pid
+                        );
+                        // Attempt to finish the process
+                        let _ = running_frame.finish(1, Some(19));
+                        finished_frames.push(Arc::clone(running_frame));
+                        false
+                    } else {
+                        // Proc finished but frame is waiting for the lock on `is_finished` to update the status
+                        // keep frame around for another round
+                        running_frame.mark_for_cache_removal();
+                        true
                     }
-                    true
-                } else if marked_for_removal {
-                    warn!(
-                        "Removing {} from the cache. Could not find proc {} for frame that was supposed to be running.",
-                        running_frame.to_string(),
-                        pid
-                    );
-                    // Attempt to finish the process
-                    let _ = running_frame.finish(1, Some(19));
+                }
+                FrameState::Finished(_) => {
                     finished_frames.push(Arc::clone(running_frame));
                     false
-                } else {
-                    // Proc finished but frame is waiting for the lock on `is_finished` to update the status
-                    // keep frame around for another round
-                    running_frame.mark_for_cache_removal();
-                    true
                 }
-            } else {
-                true
+                FrameState::FailedBeforeStart => {
+                    finished_frames.push(Arc::clone(running_frame));
+                    false
+                }
             }
         });
+
         drop(system_monitor);
         self.handle_finished_frames(finished_frames).await;
         Ok(())
@@ -235,46 +249,67 @@ impl MachineMonitor {
         match host_state {
             Some(host_state) => {
                 for frame in finished_frames {
-                    if let Some(finished_state) = frame.get_finished_state() {
-                        let frame_report = frame.into_running_frame_info();
-                        let exit_signal = match finished_state.exit_signal {
-                            Some(signal) => signal as u32,
-                            None => 0,
-                        };
-                        info!("Sending frame complete report: {}", frame);
+                    match frame.get_state_copy() {
+                        FrameState::Finished(finished_state) => {
+                            let frame_report = frame.into_running_frame_info();
+                            let exit_signal = match finished_state.exit_signal {
+                                Some(signal) => signal as u32,
+                                None => 0,
+                            };
+                            info!("Sending frame complete report: {}", frame);
 
-                        // Release resources
-                        if let Some(procs) = &frame.cpu_list {
-                            self.release_cpus(procs).await;
-                        } else {
-                            // Ensure the division rounds up if num_cores is not a multiple of
-                            // core_multiplier
-                            let num_cores_to_release = (frame.request.num_cores as u32
-                                + self.maching_config.core_multiplier
-                                - 1)
-                                / self.maching_config.core_multiplier;
-                            self.release_cores(num_cores_to_release).await;
+                            // Release resources
+                            if let Some(procs) = &frame.cpu_list {
+                                self.release_cpus(procs).await;
+                            } else {
+                                // Ensure the division rounds up if num_cores is not a multiple of
+                                // core_multiplier
+                                let num_cores_to_release = (frame.request.num_cores as u32
+                                    + self.maching_config.core_multiplier
+                                    - 1)
+                                    / self.maching_config.core_multiplier;
+                                self.release_cores(num_cores_to_release).await;
+                            }
+
+                            // Send complete report
+                            if let Err(err) = self
+                                .report_client
+                                .send_frame_complete_report(
+                                    host_state.clone(),
+                                    frame_report,
+                                    finished_state.exit_code as u32,
+                                    exit_signal,
+                                    0,
+                                )
+                                .await
+                            {
+                                error!(
+                                    "Failed to send frame_complete_report for {}. {}",
+                                    frame, err
+                                );
+                            };
                         }
-
-                        // Send complete report
-                        if let Err(err) = self
-                            .report_client
-                            .send_frame_complete_report(
-                                host_state.clone(),
-                                frame_report,
-                                finished_state.exit_code as u32,
-                                exit_signal,
-                                0,
-                            )
-                            .await
-                        {
-                            error!(
-                                "Failed to send frame_complete_report for {}. {}",
-                                frame, err
-                            );
-                        };
-                    } else {
-                        warn!("Invalid state on supposedly finished frame. {}", frame);
+                        FrameState::FailedBeforeStart => {
+                            let frame_report = frame.into_running_frame_info();
+                            // Send complete report
+                            if let Err(err) = self
+                                .report_client
+                                .send_frame_complete_report(
+                                    host_state.clone(),
+                                    frame_report,
+                                    1,  // Mark frame as failed
+                                    10, // Use signal to indicate it failed before starting
+                                    0,
+                                )
+                                .await
+                            {
+                                error!(
+                                    "Failed to send frame_complete_report for {}. {}",
+                                    frame, err
+                                );
+                            };
+                        }
+                        _ => warn!("Invalid state on supposedly finished frame. {}", frame),
                     }
                 }
             }

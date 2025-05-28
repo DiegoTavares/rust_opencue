@@ -41,10 +41,7 @@ use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, System};
 
 use miette::{Context, IntoDiagnostic, Result, miette};
-use opencue_proto::{
-    report::{ChildrenProcStats, RunningFrameInfo},
-    rqd::RunFrame,
-};
+use opencue_proto::{report::RunningFrameInfo, rqd::RunFrame};
 use uuid::Uuid;
 
 use super::logging::{FrameLogger, FrameLoggerBuilder};
@@ -79,6 +76,7 @@ pub enum FrameState {
     Created(CreatedState),
     Running(RunningState),
     Finished(FinishedState),
+    FailedBeforeStart,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -91,7 +89,7 @@ pub struct CreatedState {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct RunningState {
-    pid: u32,
+    pub pid: u32,
     start_time: SystemTime,
     // Attention: Recovered frames will never have a joinHandle
     #[serde(skip_serializing)]
@@ -194,12 +192,20 @@ impl RunningFrame {
         }
     }
 
-    pub fn get_finished_state(&self) -> Option<FinishedState> {
+    pub fn get_state_copy(&self) -> FrameState {
         let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+
         match *state {
-            FrameState::Created(_) => None,
-            FrameState::Running(_) => None,
-            FrameState::Finished(ref finished_state) => Some(FinishedState {
+            FrameState::Created(_) => FrameState::Created(CreatedState {
+                launch_thread_handle: None,
+            }),
+            FrameState::Running(ref r) => FrameState::Running(RunningState {
+                pid: r.pid.clone(),
+                start_time: r.start_time.clone(),
+                launch_thread_handle: None,
+                kill_reason: r.kill_reason.clone(),
+            }),
+            FrameState::Finished(ref finished_state) => FrameState::Finished(FinishedState {
                 pid: finished_state.pid,
                 launch_thread_handle: None,
                 start_time: finished_state.start_time,
@@ -208,6 +214,7 @@ impl RunningFrame {
                 exit_signal: finished_state.exit_signal,
                 kill_reason: None,
             }),
+            FrameState::FailedBeforeStart => FrameState::FailedBeforeStart,
         }
     }
 
@@ -231,6 +238,9 @@ impl RunningFrame {
                 Ok(())
             }
             FrameState::Finished(_) => Err(miette!("Invalid State. Frame has already finished")),
+            FrameState::FailedBeforeStart => {
+                Err(miette!("Invalid State. Frame failed before starting"))
+            }
         }
     }
 
@@ -266,6 +276,31 @@ impl RunningFrame {
                 "Invalid State. Frame {} has already finished",
                 self
             )),
+            FrameState::FailedBeforeStart => Err(miette!(
+                "Invalid State. Frame {} Failed before starting",
+                self
+            )),
+        }
+    }
+
+    pub fn fail_before_start(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        match &mut *state {
+            FrameState::Created(_) => {
+                *state = FrameState::FailedBeforeStart;
+                Ok(())
+            }
+            FrameState::Running(_) => {
+                Err(miette!("Invalid State. Frame {} has already started", self))
+            }
+            FrameState::Finished(_) => Err(miette!(
+                "Invalid State. Frame {} has already finished",
+                self
+            )),
+            FrameState::FailedBeforeStart => Err(miette!(
+                "Invalid State. Frame {} Failed before starting",
+                self
+            )),
         }
     }
 
@@ -291,6 +326,9 @@ impl RunningFrame {
                 self, running_state
             ),
             FrameState::Finished(_) => warn!("Invalid States. Frame {} has already finished", self),
+            FrameState::FailedBeforeStart => {
+                warn!("Invalid States. Frame {} failed before starting", self)
+            }
         }
     }
 
@@ -351,8 +389,11 @@ impl RunningFrame {
             self.uid,
             self.gid,
         );
-        if let Err(_) = logger_base {
-            error!("Failed to create log stream for {}", self.log_path);
+        if let Err(err) = logger_base {
+            error!("Failed to create log stream for {}: {}", self.log_path, err);
+            if let Err(err) = self.fail_before_start() {
+                error!("Failed to update failed status for {}: {}", self, err);
+            };
             return;
         }
         let logger = Arc::new(logger_base.unwrap());
@@ -361,7 +402,7 @@ impl RunningFrame {
             match self.recover_inner(Arc::clone(&logger)) {
                 Ok((exit_code, exit_signal)) => {
                     if let Err(err) = self.finish(exit_code, exit_signal) {
-                        warn!("Failed to mark frame {} as finished. {}", self, err);
+                        error!("Failed to mark frame {} as finished. {}", self, err);
                     }
                     logger.writeln(&self.write_footer());
                     Some(exit_code)
@@ -370,6 +411,9 @@ impl RunningFrame {
                     let msg = format!("Frame {} failed to be recovered. {}", self.to_string(), err);
                     logger.writeln(&msg);
                     error!(msg);
+                    if let Err(err) = self.fail_before_start() {
+                        error!("Failed to mark frame {} as finished. {}", self, err);
+                    }
                     None
                 }
             }
@@ -377,7 +421,7 @@ impl RunningFrame {
             match self.run_inner(Arc::clone(&logger)) {
                 Ok((exit_code, exit_signal)) => {
                     if let Err(err) = self.finish(exit_code, exit_signal) {
-                        warn!("Failed to mark frame {} as finished. {}", self, err);
+                        error!("Failed to mark frame {} as finished. {}", self, err);
                     }
                     logger.writeln(&self.write_footer());
                     Some(exit_code)
@@ -386,6 +430,9 @@ impl RunningFrame {
                     let msg = format!("Frame {} failed to be spawned. {}", self.to_string(), err);
                     logger.writeln(&msg);
                     error!(msg);
+                    if let Err(err) = self.fail_before_start() {
+                        error!("Failed to mark frame {} as finished. {}", self, err);
+                    }
                     None
                 }
             }
@@ -881,6 +928,7 @@ impl RunningFrame {
             FrameState::Created(_) => None,
             FrameState::Running(ref running_state) => Some(running_state.pid),
             FrameState::Finished(ref finished_state) => Some(finished_state.pid),
+            FrameState::FailedBeforeStart => None,
         }
     }
 
@@ -1023,6 +1071,9 @@ impl RunningFrame {
                     finished_state.exit_code,
                     finished_state.exit_signal
                 ))
+            }
+            FrameState::FailedBeforeStart => {
+                Err(miette!("Frame has been created and failed before starting"))
             }
         }
     }
@@ -1191,6 +1242,7 @@ impl RunningFrame {
                 let pid_running = Self::is_process_running(finished_state.pid);
                 thread_finished && !pid_running
             }
+            FrameState::FailedBeforeStart => true,
         }
     }
 
