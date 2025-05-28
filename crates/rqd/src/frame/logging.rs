@@ -81,11 +81,11 @@ impl FrameFileLogger {
 
         fs::set_permissions(path, Permissions::from_mode(0o775))
             .into_diagnostic()
-            .wrap_err("Failed to change log dir permissions: {path}")?;
+            .wrap_err(format!("Failed to change log dir permissions: {path:?}"))?;
 
         chown(path, Some(uid), Some(gid))
             .into_diagnostic()
-            .wrap_err("Failed to change log dir ownership: {path}")
+            .wrap_err(format!("Failed to change log dir ownership: {path:?}"))
     }
 
     #[cfg(target_os = "windows")]

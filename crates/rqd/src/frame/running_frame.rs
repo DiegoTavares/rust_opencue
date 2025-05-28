@@ -464,8 +464,11 @@ impl RunningFrame {
             &self.config,
             self.config.run_as_user.then(|| (self.uid, self.gid)),
         );
-        if let Err(_) = logger_base {
-            error!("Failed to create log stream for {}", self.log_path);
+        if let Err(err) = logger_base {
+            error!("Failed to create log stream for {}: {}", self.log_path, err);
+            if let Err(err) = self.fail_before_start() {
+                error!("Failed to mark frame {} as finished. {}", self, err);
+            }
             return;
         }
         let logger = Arc::new(logger_base.unwrap());
@@ -500,6 +503,9 @@ impl RunningFrame {
                     let msg = format!("Frame {} failed to be spawned. {}", self.to_string(), err);
                     logger.writeln(&msg);
                     error!(msg);
+                    if let Err(err) = self.fail_before_start() {
+                        error!("Failed to mark frame {} as finished. {}", self, err);
+                    }
                     None
                 }
             }
