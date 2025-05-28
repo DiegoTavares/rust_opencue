@@ -291,6 +291,8 @@ impl MachineMonitor {
                         }
                         FrameState::FailedBeforeStart => {
                             let frame_report = frame.into_running_frame_info();
+
+                            info!("Sending failed frame complete report: {}", frame);
                             // Send complete report
                             if let Err(err) = self
                                 .report_client

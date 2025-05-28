@@ -67,7 +67,7 @@ pub struct RunningFrame {
     raw_stderr_path: String,
     pub exit_file_path: String,
     pub entrypoint_file_path: String,
-    state: Mutex<FrameState>,
+    state: RwLock<FrameState>,
     pub remove_from_cache: RwLock<bool>,
 }
 
@@ -185,7 +185,7 @@ impl RunningFrame {
             raw_stderr_path,
             exit_file_path,
             entrypoint_file_path,
-            state: Mutex::new(FrameState::Created(CreatedState {
+            state: RwLock::new(FrameState::Created(CreatedState {
                 launch_thread_handle: None,
             })),
             remove_from_cache: RwLock::new(false),
@@ -193,7 +193,7 @@ impl RunningFrame {
     }
 
     pub fn get_state_copy(&self) -> FrameState {
-        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let state = self.state.read().unwrap_or_else(|err| err.into_inner());
 
         match *state {
             FrameState::Created(_) => FrameState::Created(CreatedState {
@@ -227,7 +227,7 @@ impl RunningFrame {
     /// for launching and monitoring this frame. It allows the system to
     /// properly manage the thread lifecycle.
     pub fn update_launch_thread_handle(&self, thread_handle: JoinHandle<()>) -> Result<()> {
-        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
         match *state {
             FrameState::Created(ref mut created_state) => {
                 created_state.launch_thread_handle = Some(thread_handle);
@@ -253,7 +253,7 @@ impl RunningFrame {
     /// This method updates the internal finished state with the termination information,
     /// which can later be used to determine if the frame succeeded or failed.
     pub fn finish(&self, exit_code: i32, exit_signal: Option<i32>) -> Result<()> {
-        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
         match &mut *state {
             FrameState::Created(_) => Err(miette!("Invalid State. Frame {} hasn't started", self)),
             FrameState::Running(running_state) => {
@@ -284,7 +284,7 @@ impl RunningFrame {
     }
 
     pub fn fail_before_start(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
         match &mut *state {
             FrameState::Created(_) => {
                 *state = FrameState::FailedBeforeStart;
@@ -310,7 +310,7 @@ impl RunningFrame {
     /// Returning an error is pointless as we want the frame that trigger this transition to finish
     /// regardless
     fn start(&self, pid: u32) {
-        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
 
         match &mut *state {
             FrameState::Created(created_state) => {
@@ -927,7 +927,7 @@ impl RunningFrame {
     /// This method safely accesses the thread-protected running state to retrieve
     /// the current PID of the frame process.
     pub(crate) fn pid(&self) -> Option<u32> {
-        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let state = self.state.read().unwrap_or_else(|err| err.into_inner());
         match *state {
             FrameState::Created(_) => None,
             FrameState::Running(ref running_state) => Some(running_state.pid),
@@ -1059,7 +1059,7 @@ impl RunningFrame {
     pub fn get_pid_to_kill(&self, reason: &String) -> Result<u32> {
         let mut lock = self
             .state
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match *lock {
             FrameState::Created(_) => Err(miette!("Frame has been created but hasn't started yet")),
@@ -1230,7 +1230,7 @@ impl RunningFrame {
     }
 
     pub fn is_finished(&self) -> bool {
-        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let state = self.state.read().unwrap_or_else(|err| err.into_inner());
 
         match *state {
             FrameState::Created(_) => false,
@@ -1308,7 +1308,7 @@ Environment Variables:
         let frame_stats = frame_stats_lock.clone();
         drop(frame_stats_lock);
 
-        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let state = self.state.read().unwrap_or_else(|err| err.into_inner());
         match *state {
             FrameState::Finished(ref finished_state) => {
                 let exit_status = finished_state.exit_code;
