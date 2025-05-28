@@ -26,12 +26,11 @@ impl FrameLoggerBuilder {
     pub fn from_logger_config(
         path: String,
         logger_config: &RunnerConfig,
-        uid: u32,
-        gid: u32,
+        uid_gid: Option<(u32, u32)>,
     ) -> Result<Arc<dyn FrameLoggerT + Send + Sync + 'static>> {
         match logger_config.logger {
             LoggerType::File => {
-                FrameFileLogger::init(path, logger_config.prepend_timestamp, Some((uid, gid)))
+                FrameFileLogger::init(path, logger_config.prepend_timestamp, uid_gid)
                     .map(|a| Arc::new(a) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
             }
         }

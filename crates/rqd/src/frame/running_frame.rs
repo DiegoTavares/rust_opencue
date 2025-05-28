@@ -386,8 +386,7 @@ impl RunningFrame {
         let logger_base = FrameLoggerBuilder::from_logger_config(
             self.log_path.clone(),
             &self.config,
-            self.uid,
-            self.gid,
+            self.config.run_as_user.then(|| (self.uid, self.gid)),
         );
         if let Err(err) = logger_base {
             error!("Failed to create log stream for {}: {}", self.log_path, err);
@@ -463,8 +462,7 @@ impl RunningFrame {
         let logger_base = FrameLoggerBuilder::from_logger_config(
             self.log_path.clone(),
             &self.config,
-            self.uid,
-            self.gid,
+            self.config.run_as_user.then(|| (self.uid, self.gid)),
         );
         if let Err(_) = logger_base {
             error!("Failed to create log stream for {}", self.log_path);
