@@ -54,7 +54,7 @@ pub struct RunningFrame {
     pub job_id: Uuid,
     pub frame_id: Uuid,
     pub layer_id: Uuid,
-    pub frame_stats: RwLock<ProcessStats>,
+    frame_stats: RwLock<ProcessStats>,
     pub log_path: String,
     uid: u32,
     gid: u32,
@@ -68,7 +68,7 @@ pub struct RunningFrame {
     pub exit_file_path: String,
     pub entrypoint_file_path: String,
     state: RwLock<FrameState>,
-    pub should_remove_from_cache: RwLock<bool>,
+    should_remove_from_cache: RwLock<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -190,6 +190,20 @@ impl RunningFrame {
             })),
             should_remove_from_cache: RwLock::new(false),
         }
+    }
+
+    pub fn get_frame_stats_copy(&self) -> ProcessStats {
+        self.frame_stats
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn update_frame_stats(&self, proc_stats: ProcessStats) {
+        self.frame_stats
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .update(proc_stats);
     }
 
     pub fn get_state_copy(&self) -> FrameState {
@@ -397,48 +411,32 @@ impl RunningFrame {
         }
         let logger = Arc::new(logger_base.unwrap());
 
-        let exit_code = if recover_mode {
-            match self.recover_inner(Arc::clone(&logger)) {
-                Ok((exit_code, exit_signal)) => {
-                    if let Err(err) = self.finish(exit_code, exit_signal) {
-                        error!("Failed to mark frame {} as finished. {}", self, err);
-                    }
-                    logger.writeln(&self.write_footer());
-                    Some(exit_code)
-                }
-                Err(err) => {
-                    let msg = format!("Frame {} failed to be recovered. {}", self.to_string(), err);
-                    logger.writeln(&msg);
-                    error!(msg);
-                    if let Err(err) = self.fail_before_start() {
-                        error!("Failed to mark frame {} as finished. {}", self, err);
-                    }
-                    None
-                }
-            }
+        let output = if recover_mode {
+            self.recover_inner(Arc::clone(&logger))
         } else {
-            match self.run_inner(Arc::clone(&logger)) {
-                Ok((exit_code, exit_signal)) => {
-                    if let Err(err) = self.finish(exit_code, exit_signal) {
-                        error!("Failed to mark frame {} as finished. {}", self, err);
-                    }
-                    logger.writeln(&self.write_footer());
-                    Some(exit_code)
+            self.run_inner(Arc::clone(&logger))
+        };
+        let was_spawned = match output {
+            Ok((exit_code, exit_signal)) => {
+                if let Err(err) = self.finish(exit_code, exit_signal) {
+                    error!("Failed to mark frame {} as finished. {}", self, err);
                 }
-                Err(err) => {
-                    let msg = format!("Frame {} failed to be spawned. {}", self.to_string(), err);
-                    logger.writeln(&msg);
-                    error!(msg);
-                    if let Err(err) = self.fail_before_start() {
-                        error!("Failed to mark frame {} as finished. {}", self, err);
-                    }
-                    None
+                logger.writeln(&self.write_footer());
+                true
+            }
+            Err(err) => {
+                let msg = format!("Frame {} failed to be spawned. {}", self.to_string(), err);
+                logger.writeln(&msg);
+                error!(msg);
+                if let Err(err) = self.fail_before_start() {
+                    error!("Failed to mark frame {} as finished. {}", self, err);
                 }
+                false
             }
         };
         if let Err(err) = self.clear_snapshot() {
             // Only warn if a job was actually launched
-            if exit_code.is_some() {
+            if was_spawned {
                 warn!(
                     "Failed to clear snapshot {}: {}",
                     self.snapshot_path().unwrap_or("empty_path".to_string()),
@@ -1434,6 +1432,13 @@ Render Frame Completed
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *lock = true;
+    }
+
+    pub fn is_marked_for_cache_removal(&self) -> bool {
+        *self
+            .should_remove_from_cache
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

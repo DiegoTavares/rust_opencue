@@ -36,11 +36,7 @@ impl RunningFrameCache {
         self.cache
             .iter()
             .map(|running_frame| {
-                let frame_stats = running_frame
-                    .frame_stats
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
+                let frame_stats = running_frame.get_frame_stats_copy();
                 RunningFrameInfo {
                     resource_id: running_frame.request.resource_id.clone(),
                     job_id: running_frame.request.job_id.to_string(),
