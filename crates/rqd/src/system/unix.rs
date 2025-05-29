@@ -61,7 +61,7 @@ struct MachineStaticInfo {
     pub total_swap: u64,
     /// Number of sockets (also know as physical cores)
     pub num_sockets: u32,
-    pub cores_per_proc: u32,
+    pub cores_per_socket: u32,
     // Unlike the python counterpart, the multiplier is not automatically applied to total_procs
     pub hyperthreading_multiplier: u32,
     pub boot_time: u32,
@@ -110,7 +110,7 @@ impl UnixSystem {
                 total_memory,
                 total_swap,
                 num_sockets: processor_info.num_sockets,
-                cores_per_proc: processor_info.cores_per_socket,
+                cores_per_socket: processor_info.cores_per_socket,
                 hyperthreading_multiplier: processor_info.hyperthreading_multiplier,
                 boot_time: Self::read_boot_time(&config.proc_stat_path).unwrap_or(0),
                 tags: Self::setup_tags(&config),
@@ -619,11 +619,11 @@ impl SystemManager for UnixSystem {
         let dinamic_stat = self.read_dynamic_stat()?;
         Ok(MachineStat {
             hostname: self.static_info.hostname.clone(),
-            num_procs: self.static_info.num_sockets,
+            num_procs: self.static_info.num_sockets * self.static_info.cores_per_socket,
             total_memory: self.static_info.total_memory,
             total_swap: self.static_info.total_swap,
             num_sockets: self.static_info.num_sockets,
-            cores_per_proc: self.static_info.cores_per_proc,
+            cores_per_socket: self.static_info.cores_per_socket,
             hyperthreading_multiplier: self.static_info.hyperthreading_multiplier,
             boot_time: self.static_info.boot_time,
             tags: self.static_info.tags.clone(),
@@ -905,7 +905,7 @@ mod tests {
             .expect("Initializing LinuxMachineStat failed")
             .static_info;
         assert_eq!(2, linux_monitor.num_sockets);
-        assert_eq!(2, linux_monitor.cores_per_proc);
+        assert_eq!(2, linux_monitor.cores_per_socket);
         assert_eq!(1, linux_monitor.hyperthreading_multiplier);
     }
 
@@ -1022,7 +1022,7 @@ mod tests {
 
         // Proc
         assert_eq!(2, static_info.num_sockets);
-        assert_eq!(2, static_info.cores_per_proc);
+        assert_eq!(2, static_info.cores_per_socket);
         assert_eq!(1, static_info.hyperthreading_multiplier);
 
         // attributes
@@ -1257,7 +1257,7 @@ mod tests {
                     total_memory: 0,
                     total_swap: 0,
                     num_sockets: physical_cpus,
-                    cores_per_proc: cores_per_cpu,
+                    cores_per_socket: cores_per_cpu,
                     hyperthreading_multiplier: 1,
                     boot_time: 0,
                     tags: vec![],

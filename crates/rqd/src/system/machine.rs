@@ -95,7 +95,7 @@ impl MachineMonitor {
             .lock()
             .await
             .replace(host_state.clone());
-        let total_cores = host_state.num_procs * self.maching_config.core_multiplier as i32;
+        let total_cores = host_state.num_procs * host_state.cores_per_proc as i32;
         let initial_core_state = CoreDetail {
             total_cores,
             idle_cores: total_cores,
@@ -323,8 +323,8 @@ impl MachineMonitor {
             nimby_enabled: system.init_nimby()?,
             nimby_locked: false, // TODO: implement nimby lock
             facility: config.facility.clone(),
-            num_procs: stats.num_procs as i32,
-            cores_per_proc: (stats.cores_per_proc * config.core_multiplier) as i32,
+            num_procs: stats.num_sockets as i32,
+            cores_per_proc: (stats.cores_per_socket * config.core_multiplier) as i32,
             total_swap: (stats.total_swap / KIB) as i64,
             total_mem: (stats.total_memory / KIB) as i64,
             total_mcp: (stats.total_temp_storage / KIB) as i64,
