@@ -9,6 +9,7 @@ use super::running_frame::RunningFrame;
 
 /// Keep track of all frames currently running
 /// without losing track of what's running
+/// Key: frame_id
 pub struct RunningFrameCache {
     cache: DashMap<Uuid, Arc<RunningFrame>>,
 }

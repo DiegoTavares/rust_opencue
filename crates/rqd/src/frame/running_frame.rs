@@ -68,7 +68,7 @@ pub struct RunningFrame {
     pub exit_file_path: String,
     pub entrypoint_file_path: String,
     state: RwLock<FrameState>,
-    pub remove_from_cache: RwLock<bool>,
+    pub should_remove_from_cache: RwLock<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -188,7 +188,7 @@ impl RunningFrame {
             state: RwLock::new(FrameState::Created(CreatedState {
                 launch_thread_handle: None,
             })),
-            remove_from_cache: RwLock::new(false),
+            should_remove_from_cache: RwLock::new(false),
         }
     }
 
@@ -1430,7 +1430,7 @@ Render Frame Completed
 
     pub fn mark_for_cache_removal(&self) {
         let mut lock = self
-            .remove_from_cache
+            .should_remove_from_cache
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *lock = true;
