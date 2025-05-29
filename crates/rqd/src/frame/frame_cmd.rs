@@ -108,6 +108,8 @@ wait_for_output $exit_code
         self.end_cmd = Some(script.clone());
 
         file.write_all(script.as_bytes()).into_diagnostic()?;
+        // Explicitly close the file before execution to avoid "Text file busy" errors
+        drop(file);
         // Make the entrypoint file executable
         fs::set_permissions(
             &self.entrypoint_file_path,
