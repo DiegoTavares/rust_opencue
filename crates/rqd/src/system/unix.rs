@@ -77,6 +77,15 @@ pub struct MachineDynamicInfo {
     pub load: u32,
 }
 
+struct SessionData {
+    memory: u64,
+    virtual_memory: u64,
+    gpu_memory: u64,
+    start_time: u64,
+    run_time: u64,
+    lineage_stats: Vec<ProcStats>,
+}
+
 impl UnixSystem {
     /// Initialize the unix sstats collector which reads Cpu and Memory information from
     /// the OS.
@@ -523,7 +532,7 @@ impl UnixSystem {
     /// Refresh the cache of children procs.
     ///
     /// This method relies on sysinfo to have been updated periodically
-    /// throught the read_dynamic_stat method to gather the updated list
+    /// throught the refresh_procs method to gather the updated list
     /// of running processes
     fn refresh_procs_cache(&self) {
         let sysinfo = self
@@ -531,41 +540,57 @@ impl UnixSystem {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         self.procs_lineage_cache.clear();
-        // Group all processes by session_id
-        for (session_pid, pid) in sysinfo.processes().iter().map(|(children_pid, proc)| {
+        // Collect all session_ids
+        let session_id_and_pid = sysinfo.processes().iter().map(|(children_pid, proc)| {
             let session_pid = proc.session_id().unwrap_or(Pid::from_u32(0)).as_u32();
             (session_pid, children_pid.clone().as_u32())
-        }) {
+        });
+        // Group all processes by session_id
+        for (session_pid, pid) in session_id_and_pid {
             self.procs_lineage_cache
                 .entry(session_pid)
-                .and_modify(|procs| procs.push(pid))
+                .and_modify(|procs| {
+                    if !procs.contains(&pid) {
+                        procs.push(pid);
+                    }
+                })
                 .or_insert(vec![pid]);
         }
     }
 
     /// Calculates memory usage of all processes associated with a session ID.
     ///
+    /// This method aggregates memory statistics for a process and all of its children
+    /// that share the same session ID. It also collects additional process information
+    /// such as command line, start time, and runtime.
+    ///
     /// # Arguments
     ///
     /// * `session_id` - The session ID to calculate memory for
-    /// * `sysinfo` - A mutex guard containing system information
     ///
     /// # Returns
     ///
-    /// A tuple containing:
-    /// * Memory usage in bytes
-    /// * Virtual memory usage in bytes
-    /// * GPU memory usage in bytes (currently always 0)
-    /// * Proc runtime in seconds
-    /// * Vec of stats for all procs on the lineage
-    /// * The updated mutex guard reference
-    fn calculate_session_memory<'a>(
-        &self,
-        session_id: &u32,
-        sysinfo: MutexGuard<'a, System>,
-    ) -> (u64, u64, u64, u64, Vec<ProcStats>, MutexGuard<'a, System>) {
+    /// An `Option<SessionData>` containing:
+    /// * Memory usage in kilobytes
+    /// * Virtual memory usage in kilobytes
+    /// * GPU memory usage in kilobytes (currently always 0)
+    /// * Process start time in seconds since epoch
+    /// * Process runtime in seconds
+    /// * Vector of stats for all processes in the lineage
+    ///
+    /// Returns `None` if the process that created the session ID doesn't exist or cannot be
+    /// accessed.
+    fn calculate_session_memory(&self, session_id: &u32) -> Option<SessionData> {
+        let sysinfo = self
+            .sysinfo_system
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if sysinfo.process(Pid::from(*session_id as usize)).is_none() {
+            return None;
+        }
+
         let mut children = Vec::new();
-        let (memory, virtual_memory, gpu_memory, run_time) =
+        let (memory, virtual_memory, gpu_memory, start_time, run_time) =
             match self.procs_lineage_cache.get(session_id) {
                 Some(ref lineage) => lineage
                     .iter()
@@ -581,36 +606,64 @@ impl UnixSystem {
                                 let proc_vmemory = proc.virtual_memory() / 1024;
                                 let cmdline =
                                     proc.cmd().iter().map(|oss| oss.to_string_lossy()).join(" ");
-                                children.push(ProcStats {
-                                    stat: Some(Stat {
-                                        rss: proc_memory as i64,
-                                        vsize: proc_vmemory as i64,
-                                        state: "".to_string(),
-                                        name: proc.name().to_string_lossy().to_string(),
-                                        pid: pid.to_string(),
-                                    }),
-                                    statm: None,
-                                    status: None,
-                                    cmdline,
-                                    start_time: start_time_str,
-                                });
-                                (proc_memory, proc_vmemory, 0, proc.run_time())
+
+                                // Check for potential duplicates
+                                if children.iter().any(|child: &ProcStats| {
+                                    if let Some(ref stat) = child.stat {
+                                        stat.rss == proc_memory as i64 &&
+                                        stat.vsize == proc_vmemory as i64 &&
+                                        stat.name == proc.name().to_string_lossy() &&
+                                        child.cmdline == cmdline
+                                    } else { false }
+                                }) {
+                                    warn!("Potential duplicate process detected: PID {} has same memory/name/cmdline as existing process", pid);
+                                    (0, 0, 0, u64::MAX, 0)
+                                } else {
+                                    children.push(ProcStats {
+                                        stat: Some(Stat {
+                                            rss: proc_memory as i64,
+                                            vsize: proc_vmemory as i64,
+                                            state: "".to_string(),
+                                            name: proc.name().to_string_lossy().to_string(),
+                                            pid: pid.to_string(),
+                                        }),
+                                        statm: None,
+                                        status: None,
+                                        cmdline,
+                                        start_time: start_time_str,
+                                    });
+                                    (
+                                        proc_memory,
+                                        proc_vmemory,
+                                        0,
+                                        proc.start_time(),
+                                        proc.run_time(),
+                                    )
+                                }
                             }
-                            None => (0, 0, 0, 0),
+                            None => (0, 0, 0, u64::MAX, 0),
                         },
                     )
-                    .reduce(|a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, std::cmp::max(a.3, b.3)))
-                    .unwrap_or((0, 0, 0, 0)),
-                None => (0, 0, 0, 0),
+                    .reduce(|a, b| {
+                        (
+                            a.0 + b.0,
+                            a.1 + b.1,
+                            a.2 + b.2,
+                            std::cmp::min(a.3, b.3),
+                            std::cmp::max(a.4, b.4),
+                        )
+                    })
+                    .unwrap_or((0, 0, 0, u64::MAX, 0)),
+                None => (0, 0, 0, u64::MAX, 0),
             };
-        (
+        Some(SessionData {
             memory,
             virtual_memory,
             gpu_memory,
+            start_time,
             run_time,
-            children,
-            sysinfo,
-        )
+            lineage_stats: children,
+        })
     }
 }
 
@@ -776,38 +829,27 @@ impl SystemManager for UnixSystem {
             .unwrap_or_default()
             .as_secs();
 
-        let sysinfo = self
-            .sysinfo_system
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        let (
-            summed_memory,
-            summed_virtual_memory,
-            summed_gpu_memory,
-            total_run_time,
-            children,
-            guard,
-        ) = self.calculate_session_memory(&pid, sysinfo);
-
-        debug!(
-            "Collect frame stats fo {}. rss: {}kb virtual: {}kb gpu: {}kb",
-            pid, summed_memory, summed_virtual_memory, summed_gpu_memory
-        );
-        Ok(guard
-            .process(Pid::from(pid as usize))
-            .map(|proc| ProcessStats {
+        Ok(self.calculate_session_memory(&pid).map(|session_data| {
+            debug!(
+                "Collect frame stats fo {}. rss: {}kb virtual: {}kb gpu: {}kb",
+                pid, session_data.memory, session_data.virtual_memory, session_data.gpu_memory
+            );
+            ProcessStats {
                 // Caller is responsible for maintaining the Max value between calls
-                max_rss: summed_memory,
-                rss: summed_memory,
-                max_vsize: summed_virtual_memory,
-                vsize: summed_virtual_memory,
+                max_rss: session_data.memory,
+                rss: session_data.memory,
+                max_vsize: session_data.virtual_memory,
+                vsize: session_data.virtual_memory,
                 llu_time: log_mtime,
                 max_used_gpu_memory: 0,
-                used_gpu_memory: summed_gpu_memory,
-                children: Some(ChildrenProcStats { children }),
-                epoch_start_time: proc.start_time(),
-                run_time: total_run_time,
-            }))
+                used_gpu_memory: session_data.gpu_memory,
+                children: Some(ChildrenProcStats {
+                    children: session_data.lineage_stats,
+                }),
+                epoch_start_time: session_data.start_time,
+                run_time: session_data.run_time,
+            }
+        }))
     }
 
     fn refresh_procs(&self) {
