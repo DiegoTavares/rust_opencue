@@ -19,8 +19,8 @@ use opencue_proto::{
     report::{ChildrenProcStats, ProcStats, Stat},
 };
 use sysinfo::{
-    DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System,
-    UpdateKind,
+    DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate,
+    RefreshKind, UpdateKind,
 };
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -535,24 +535,23 @@ impl UnixSystem {
     /// throught the refresh_procs method to gather the updated list
     /// of running processes
     fn refresh_procs_cache(&self) {
-        let sysinfo = self
+        let mut sysinfo = self
             .sysinfo_system
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        sysinfo.refresh_processes(ProcessesToUpdate::All, true);
         self.procs_lineage_cache.clear();
         // Collect all session_ids
-        let session_id_and_pid = sysinfo.processes().iter().map(|(children_pid, proc)| {
+        let session_id_and_pid = sysinfo.processes().iter().map(|(pid, proc)| {
             let session_pid = proc.session_id().unwrap_or(Pid::from_u32(0)).as_u32();
-            (session_pid, children_pid.clone().as_u32())
+            (session_pid, pid.clone().as_u32())
         });
         // Group all processes by session_id
         for (session_pid, pid) in session_id_and_pid {
             self.procs_lineage_cache
                 .entry(session_pid)
                 .and_modify(|procs| {
-                    if !procs.contains(&pid) {
-                        procs.push(pid);
-                    }
+                    procs.push(pid);
                 })
                 .or_insert(vec![pid]);
         }
@@ -581,15 +580,17 @@ impl UnixSystem {
     /// Returns `None` if the process that created the session ID doesn't exist or cannot be
     /// accessed.
     fn calculate_session_memory(&self, session_id: &u32) -> Option<SessionData> {
-        let sysinfo = self
+        let mut sysinfo = self
             .sysinfo_system
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        let mut children = Vec::new();
+        sysinfo.refresh_processes(ProcessesToUpdate::All, true);
+
+        // Return none if the session owner has already finished
         if sysinfo.process(Pid::from(*session_id as usize)).is_none() {
             return None;
         }
-
-        let mut children = Vec::new();
         let (memory, virtual_memory, gpu_memory, start_time, run_time) =
             match self.procs_lineage_cache.get(session_id) {
                 Some(ref lineage) => lineage
@@ -608,38 +609,26 @@ impl UnixSystem {
                                     proc.cmd().iter().map(|oss| oss.to_string_lossy()).join(" ");
 
                                 // Check for potential duplicates
-                                if children.iter().any(|child: &ProcStats| {
-                                    if let Some(ref stat) = child.stat {
-                                        stat.rss == proc_memory as i64 &&
-                                        stat.vsize == proc_vmemory as i64 &&
-                                        stat.name == proc.name().to_string_lossy() &&
-                                        child.cmdline == cmdline
-                                    } else { false }
-                                }) {
-                                    warn!("Potential duplicate process detected: PID {} has same memory/name/cmdline as existing process", pid);
-                                    (0, 0, 0, u64::MAX, 0)
-                                } else {
-                                    children.push(ProcStats {
-                                        stat: Some(Stat {
-                                            rss: proc_memory as i64,
-                                            vsize: proc_vmemory as i64,
-                                            state: "".to_string(),
-                                            name: proc.name().to_string_lossy().to_string(),
-                                            pid: pid.to_string(),
-                                        }),
-                                        statm: None,
-                                        status: None,
-                                        cmdline,
-                                        start_time: start_time_str,
-                                    });
-                                    (
-                                        proc_memory,
-                                        proc_vmemory,
-                                        0,
-                                        proc.start_time(),
-                                        proc.run_time(),
-                                    )
-                                }
+                                children.push(ProcStats {
+                                    stat: Some(Stat {
+                                        rss: proc_memory as i64,
+                                        vsize: proc_vmemory as i64,
+                                        state: "".to_string(),
+                                        name: proc.name().to_string_lossy().to_string(),
+                                        pid: pid.to_string(),
+                                    }),
+                                    statm: None,
+                                    status: None,
+                                    cmdline,
+                                    start_time: start_time_str,
+                                });
+                                (
+                                    proc_memory,
+                                    proc_vmemory,
+                                    0,
+                                    proc.start_time(),
+                                    proc.run_time(),
+                                )
                             }
                             None => (0, 0, 0, u64::MAX, 0),
                         },
