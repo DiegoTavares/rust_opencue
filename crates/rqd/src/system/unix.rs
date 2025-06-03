@@ -4,8 +4,8 @@ use std::{
     io::{BufRead, BufReader, ErrorKind},
     net::ToSocketAddrs,
     path::Path,
-    process::{self, Command},
-    sync::{Mutex, MutexGuard},
+    process::Command,
+    sync::Mutex,
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -582,6 +582,41 @@ impl UnixSystem {
         }
     }
 
+    fn is_valid_proc(pid: &u32) -> Result<bool> {
+        let stat_path = format!("/proc/{}/status", pid);
+
+        let status_f = File::open(stat_path).into_diagnostic()?;
+        let reader = BufReader::new(status_f);
+        // let mut load_val: Vec<u32> = vec![];
+        let mut pid: Option<u32> = None;
+        let mut tgid: Option<u32> = None;
+        for line_res in reader.lines().into_iter() {
+            match line_res {
+                Ok(line) => {
+                    if line.starts_with("Pid") {
+                        pid = line
+                            .split(":")
+                            .last()
+                            .map(|val| val.trim().parse().ok())
+                            .flatten()
+                    } else if line.starts_with("Tgid") {
+                        tgid = line
+                            .split(":")
+                            .last()
+                            .map(|val| val.trim().parse().ok())
+                            .flatten()
+                    }
+                }
+                _ => (),
+            };
+        }
+
+        Ok(match (pid, tgid) {
+            (Some(pid), Some(tgid)) => pid == tgid,
+            _ => false,
+        })
+    }
+
     /// Calculates memory usage of all processes associated with a session ID.
     ///
     /// This method aggregates memory statistics for a process and all of its children
@@ -623,7 +658,11 @@ impl UnixSystem {
                     .iter()
                     .filter_map(
                         |pid| match sysinfo.process(Pid::from(pid.clone() as usize)) {
-                            Some(proc) if !Self::is_proc_dead(Some(proc)) => {
+                            Some(proc)
+                                if !Self::is_proc_dead(Some(proc))
+                                    && Self::is_valid_proc(pid).unwrap_or(false) =>
+                            {
+                                // Confirm this is a proc and not a thread
                                 let start_time_str = DateTime::<Local>::from(
                                     UNIX_EPOCH + Duration::from_secs(proc.start_time()),
                                 )
@@ -639,7 +678,7 @@ impl UnixSystem {
                                     stat: Some(Stat {
                                         rss: proc_memory as i64,
                                         vsize: proc_vmemory as i64,
-                                        state: "".to_string(),
+                                        state: proc.status().to_string(),
                                         name: proc.name().to_string_lossy().to_string(),
                                         pid: pid.to_string(),
                                     }),

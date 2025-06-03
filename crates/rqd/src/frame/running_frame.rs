@@ -12,7 +12,7 @@ use std::{
     path::Path,
     process::ExitStatus,
     str::FromStr,
-    sync::{Arc, Mutex, RwLock, mpsc::Receiver},
+    sync::{Arc, RwLock, mpsc::Receiver},
     thread::JoinHandle,
     time::{Duration, SystemTime},
 };
@@ -1344,10 +1344,11 @@ Environment Variables:
                                 format!(
                                     r#"____________________________________________________________________________________________________
     child_pid           {}
+    name                {} - {}
     cmdline             {}
     maxrss              {}
     start_time          {}"#,
-                                    child_stat.pid, child.cmdline, child_stat.rss, child.start_time
+                                    child_stat.pid, child_stat.name, child_stat.state, child.cmdline, child_stat.rss, child.start_time
                                 )
                             })
                             .join("\n")
