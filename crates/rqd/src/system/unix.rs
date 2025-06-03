@@ -668,8 +668,8 @@ impl UnixSystem {
                                 )
                                 .format("%Y-%m-%d %H:%M:%S")
                                 .to_string();
-                                let proc_memory = proc.memory() / 1024;
-                                let proc_vmemory = proc.virtual_memory() / 1024;
+                                let proc_memory = proc.memory();
+                                let proc_vmemory = proc.virtual_memory();
                                 let cmdline =
                                     proc.cmd().iter().map(|oss| oss.to_string_lossy()).join(" ");
 
