@@ -30,6 +30,7 @@ use bollard::{
         MountBindOptionsPropagationEnum, MountTypeEnum,
     },
 };
+use bytesize::KIB;
 use chrono::{DateTime, Local};
 use futures::StreamExt;
 use itertools::{Either, Itertools};
@@ -1414,15 +1415,15 @@ Render Frame Completed
             layer_id: self.request.layer_id.clone(),
             num_cores: self.request.num_cores,
             start_time: start_time as i64,
-            max_rss: stats.max_rss as i64,
-            rss: stats.rss as i64,
-            max_vsize: stats.max_vsize as i64,
-            vsize: stats.vsize as i64,
+            max_rss: (stats.max_rss / KIB) as i64,
+            rss: (stats.rss / KIB) as i64,
+            max_vsize: (stats.max_vsize / KIB) as i64,
+            vsize: (stats.vsize / KIB) as i64,
             attributes: self.request.attributes.clone(),
             llu_time: stats.llu_time as i64,
             num_gpus: self.request.num_gpus,
-            max_used_gpu_memory: stats.max_used_gpu_memory as i64,
-            used_gpu_memory: stats.used_gpu_memory as i64,
+            max_used_gpu_memory: (stats.max_used_gpu_memory / KIB) as i64,
+            used_gpu_memory: (stats.used_gpu_memory / KIB) as i64,
             children,
         }
     }
