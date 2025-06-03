@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader, ErrorKind},
     net::ToSocketAddrs,
     path::Path,
-    process::Command,
+    process::{self, Command},
     sync::{Mutex, MutexGuard},
     time::{Duration, UNIX_EPOCH},
 };
@@ -19,8 +19,8 @@ use opencue_proto::{
     report::{ChildrenProcStats, ProcStats, Stat},
 };
 use sysinfo::{
-    DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate,
-    RefreshKind, UpdateKind,
+    DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessStatus,
+    ProcessesToUpdate, RefreshKind, UpdateKind,
 };
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -542,9 +542,22 @@ impl UnixSystem {
         sysinfo.refresh_processes(ProcessesToUpdate::All, true);
         self.procs_lineage_cache.clear();
         // Collect all session_ids
-        let session_id_and_pid = sysinfo.processes().iter().map(|(pid, proc)| {
+        let session_id_and_pid = sysinfo.processes().iter().filter_map(|(pid, proc)| {
             let session_pid = proc.session_id().unwrap_or(Pid::from_u32(0)).as_u32();
-            (session_pid, pid.clone().as_u32())
+            // Only collect procs that are actively consuming memory
+            match proc.status() {
+                ProcessStatus::Idle
+                | ProcessStatus::Run
+                | ProcessStatus::Sleep
+                | ProcessStatus::Wakekill
+                | ProcessStatus::Waking
+                | ProcessStatus::Parked
+                | ProcessStatus::LockBlocked
+                | ProcessStatus::UninterruptibleDiskSleep => {
+                    Some((session_pid, pid.clone().as_u32()))
+                }
+                _ => None,
+            }
         });
         // Group all processes by session_id
         for (session_pid, pid) in session_id_and_pid {
@@ -554,6 +567,18 @@ impl UnixSystem {
                     procs.push(pid);
                 })
                 .or_insert(vec![pid]);
+        }
+    }
+
+    fn is_proc_dead(process: Option<&sysinfo::Process>) -> bool {
+        match process {
+            Some(proc)
+                if vec![ProcessStatus::Dead, ProcessStatus::Zombie].contains(&proc.status()) =>
+            {
+                true
+            }
+            None => true,
+            _ => false,
         }
     }
 
@@ -579,7 +604,7 @@ impl UnixSystem {
     ///
     /// Returns `None` if the process that created the session ID doesn't exist or cannot be
     /// accessed.
-    fn calculate_session_memory(&self, session_id: &u32) -> Option<SessionData> {
+    fn calculate_proc_session_data(&self, session_id: &u32) -> Option<SessionData> {
         let mut sysinfo = self
             .sysinfo_system
             .lock()
@@ -587,17 +612,18 @@ impl UnixSystem {
         let mut children = Vec::new();
         sysinfo.refresh_processes(ProcessesToUpdate::All, true);
 
-        // Return none if the session owner has already finished
-        if sysinfo.process(Pid::from(*session_id as usize)).is_none() {
+        // Return none if the session owner has already finished or died
+        if Self::is_proc_dead(sysinfo.process(Pid::from(*session_id as usize))) {
             return None;
         }
+        // If session owner is still alive, iterate over the session and calculate memory
         let (memory, virtual_memory, gpu_memory, start_time, run_time) =
             match self.procs_lineage_cache.get(session_id) {
                 Some(ref lineage) => lineage
                     .iter()
-                    .map(
+                    .filter_map(
                         |pid| match sysinfo.process(Pid::from(pid.clone() as usize)) {
-                            Some(proc) => {
+                            Some(proc) if !Self::is_proc_dead(Some(proc)) => {
                                 let start_time_str = DateTime::<Local>::from(
                                     UNIX_EPOCH + Duration::from_secs(proc.start_time()),
                                 )
@@ -622,15 +648,15 @@ impl UnixSystem {
                                     cmdline,
                                     start_time: start_time_str,
                                 });
-                                (
+                                Some((
                                     proc_memory,
                                     proc_vmemory,
                                     0,
                                     proc.start_time(),
                                     proc.run_time(),
-                                )
+                                ))
                             }
-                            None => (0, 0, 0, u64::MAX, 0),
+                            _ => None,
                         },
                     )
                     .reduce(|a, b| {
@@ -818,7 +844,7 @@ impl SystemManager for UnixSystem {
             .unwrap_or_default()
             .as_secs();
 
-        Ok(self.calculate_session_memory(&pid).map(|session_data| {
+        Ok(self.calculate_proc_session_data(&pid).map(|session_data| {
             debug!(
                 "Collect frame stats fo {}. rss: {}kb virtual: {}kb gpu: {}kb",
                 pid, session_data.memory, session_data.virtual_memory, session_data.gpu_memory
