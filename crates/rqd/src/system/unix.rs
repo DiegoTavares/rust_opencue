@@ -77,12 +77,19 @@ pub struct MachineDynamicInfo {
     pub load: u32,
 }
 
+/// Aggregated Data refering to a process session
 struct SessionData {
+    /// Amount of memory used by all processes in this session
     memory: u64,
+    /// Amount of virtual memory used by all processes in this session
     virtual_memory: u64,
+    /// Amount of gpu used by all processes in this session
     gpu_memory: u64,
+    /// Earlier start time on the session
     start_time: u64,
+    /// Longer run time on the session
     run_time: u64,
+    /// Stats for all the processes on this session (leader procs only, tasks are excluded)
     lineage_stats: Vec<ProcStats>,
 }
 
@@ -544,7 +551,7 @@ impl UnixSystem {
         // Collect all session_ids
         let session_id_and_pid = sysinfo.processes().iter().filter_map(|(pid, proc)| {
             let session_pid = proc.session_id().unwrap_or(Pid::from_u32(0)).as_u32();
-            // Only collect procs that are actively consuming memory
+            // Filter out procs on a state that doesn't consume memory
             match proc.status() {
                 ProcessStatus::Idle
                 | ProcessStatus::Run
@@ -570,6 +577,14 @@ impl UnixSystem {
         }
     }
 
+    /// Checks if a process is dead or non-existent
+    ///
+    /// # Arguments
+    /// * `process` - An optional reference to a sysinfo::Process
+    ///
+    /// # Returns
+    /// * `bool` - Returns true if the process is dead, zombied, or doesn't exist (None).
+    ///           Returns false if the process exists and is in any other state.
     fn is_proc_dead(process: Option<&sysinfo::Process>) -> bool {
         match process {
             Some(proc)
@@ -582,7 +597,20 @@ impl UnixSystem {
         }
     }
 
-    fn is_valid_proc(pid: &u32) -> Result<bool> {
+    /// Check if a pid belongs to a process that is the owner of its thread group
+    ///
+    /// Although this module tries to avoid messing with /proc files directly to prevent
+    /// compatibility issues with different kernel versions in favor of using the sysinfo
+    /// crate, it doesn't provide a way to capture a process tgid. Without a process tgid
+    /// it is impossible to set apart leader processes and their tasks.
+    ///
+    /// # Arguments
+    /// * `pid` - The process ID to check
+    ///
+    /// # Returns
+    /// * `Result<bool>` - Ok(true) if the process is a thread group leader, Ok(false) if not,
+    ///   or an error if the process information couldn't be read
+    fn is_thread_group_leader(pid: &u32) -> Result<bool> {
         let stat_path = format!("/proc/{}/status", pid);
 
         let status_f = File::open(stat_path).into_diagnostic()?;
@@ -660,7 +688,7 @@ impl UnixSystem {
                         |pid| match sysinfo.process(Pid::from(pid.clone() as usize)) {
                             Some(proc)
                                 if !Self::is_proc_dead(Some(proc))
-                                    && Self::is_valid_proc(pid).unwrap_or(false) =>
+                                    && Self::is_thread_group_leader(pid).unwrap_or(false) =>
                             {
                                 // Confirm this is a proc and not a thread
                                 let start_time_str = DateTime::<Local>::from(
