@@ -280,7 +280,7 @@ impl MachineMonitor {
 
                 // Release resources
                 if let Some(procs) = &frame.cpu_list {
-                    self.release_cpus(procs).await;
+                    self.release_threads(procs).await;
                 } else {
                     // Ensure the division rounds up if num_cores is not a multiple of
                     // core_multiplier
@@ -364,7 +364,7 @@ pub trait Machine {
     /// by this request
     async fn reserve_cores(
         &self,
-        num_cores: u32,
+        num_cores: usize,
         resource_id: Uuid,
         with_affinity: bool,
     ) -> Result<Option<Vec<u32>>>;
@@ -382,12 +382,12 @@ pub trait Machine {
     async fn reserve_cores_by_id(&self, cpu_list: &Vec<u32>, resource_id: Uuid)
     -> Result<Vec<u32>>;
 
-    /// Release specific CPU cores by their IDs
+    /// Release specific threads
     ///
     /// # Arguments
     ///
-    /// * `procs` - Vector of CPU core IDs to release
-    async fn release_cpus(&self, procs: &Vec<u32>);
+    /// * `threads` - Vector of thread IDs to release
+    async fn release_threads(&self, thread_ids: &Vec<u32>);
 
     /// Releases a specified number of CPU cores
     ///
@@ -472,7 +472,7 @@ impl Machine for MachineMonitor {
 
     async fn reserve_cores(
         &self,
-        num_cores: u32,
+        num_cores: usize,
         resource_id: Uuid,
         with_affinity: bool,
     ) -> Result<Option<Vec<u32>>> {
@@ -492,7 +492,7 @@ impl Machine for MachineMonitor {
             let mut core_state = self.core_state.lock().await;
             debug!("Before: {:?}", *core_state);
             core_state
-                .reserve(num_cores * self.maching_config.core_multiplier)
+                .reserve(num_cores * self.maching_config.core_multiplier as usize)
                 .map_err(|err| miette!(err))?;
             debug!("After: {:?}", *core_state);
         }
@@ -516,23 +516,24 @@ impl Machine for MachineMonitor {
         if let Ok(_) = &cores_result {
             let mut core_state = self.core_state.lock().await;
             core_state
-                .reserve(cpu_list.len() as u32 * self.maching_config.core_multiplier)
+                .reserve(cpu_list.len() * self.maching_config.core_multiplier as usize)
                 .map_err(|err| miette!(err))?;
         }
         cores_result
     }
 
-    async fn release_cpus(&self, procs: &Vec<u32>) {
+    async fn release_threads(&self, thread_ids: &Vec<u32>) {
         {
             let mut system = self.system_manager.lock().await;
-            for core_id in procs {
-                if let Err(err) = system.release_core(core_id) {
+            for thread_id in thread_ids {
+                if let Err(err) = system.release_core_by_thread(thread_id) {
                     match err {
-                        ReservationError::NotFoundError(_) => {
-                            warn!("Failed to release proc {core_id}. Reservation not found")
+                        ReservationError::ReservationNotFound(_) => {
+                            // NoOp. When releasing a thread, the entire core might be released,
+                            // threfore misses are expected
                         }
                         _ => {
-                            error!("Failed to release proc {core_id}. Unexpected error")
+                            error!("Failed to release proc {thread_id}. Unexpected error")
                         }
                     }
                 }
@@ -541,7 +542,7 @@ impl Machine for MachineMonitor {
         // Record reservation to be reported to cuebot
         let mut core_state = self.core_state.lock().await;
         if let Err(err) = core_state
-            .release(procs.len() as u32 * self.maching_config.core_multiplier)
+            .release(thread_ids.len() as u32 * self.maching_config.core_multiplier)
             .map_err(|err| miette!(err))
         {
             error!(
