@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use bytesize::KIB;
@@ -279,8 +282,8 @@ impl MachineMonitor {
                 info!("Sending frame complete report: {}", frame);
 
                 // Release resources
-                if let Some(procs) = &frame.cpu_list {
-                    self.release_threads(procs).await;
+                if let Some(threads) = &frame.cpu_list {
+                    self.release_threads(threads).await;
                 } else {
                     // Ensure the division rounds up if num_cores is not a multiple of
                     // core_multiplier
@@ -523,11 +526,15 @@ impl Machine for MachineMonitor {
     }
 
     async fn release_threads(&self, thread_ids: &Vec<u32>) {
+        let mut released_cores = HashSet::new();
         {
             let mut system = self.system_manager.lock().await;
             for thread_id in thread_ids {
-                if let Err(err) = system.release_core_by_thread(thread_id) {
-                    match err {
+                match system.release_core_by_thread(thread_id) {
+                    Ok((phys_id, core_id)) => {
+                        released_cores.insert((phys_id, core_id));
+                    }
+                    Err(err) => match err {
                         ReservationError::ReservationNotFound(_) => {
                             // NoOp. When releasing a thread, the entire core might be released,
                             // threfore misses are expected
@@ -535,14 +542,14 @@ impl Machine for MachineMonitor {
                         _ => {
                             error!("Failed to release proc {thread_id}. Unexpected error")
                         }
-                    }
+                    },
                 }
             }
         }
         // Record reservation to be reported to cuebot
         let mut core_state = self.core_state.lock().await;
         if let Err(err) = core_state
-            .release(thread_ids.len() as u32 * self.maching_config.core_multiplier)
+            .release(released_cores.len() as u32 * self.maching_config.core_multiplier)
             .map_err(|err| miette!(err))
         {
             error!(

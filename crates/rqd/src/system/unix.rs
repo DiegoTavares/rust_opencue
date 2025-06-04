@@ -816,7 +816,7 @@ impl SystemManager for UnixSystem {
         self.cpu_stat.clone()
     }
 
-    fn release_core_by_thread(&mut self, thread_id: &u32) -> Result<(), ReservationError> {
+    fn release_core_by_thread(&mut self, thread_id: &u32) -> Result<(u32, u32), ReservationError> {
         let (phys_id, core_id) = self
             .thread_id_lookup_table
             .get(thread_id)
@@ -826,7 +826,7 @@ impl SystemManager for UnixSystem {
             .get_mut(phys_id)
             .ok_or(ReservationError::ReservationNotFound(core_id.clone()))?
             .remove(core_id);
-        Ok(())
+        Ok((*phys_id, *core_id))
     }
 
     /// Returns a list of threadids from the reserved core
