@@ -160,11 +160,11 @@ impl FrameManager {
                 .map(|rf| Arc::new(rf));
             match running_frame {
                 Ok(running_frame) => {
-                    // Update reservations. If a cpu_list exists, the frame was booked using affinity
-                    if let Err(err) = match &running_frame.cpu_list {
-                        Some(cpu_list) => self
+                    // Update reservations. If a thread_ids list exists, the frame was booked using affinity
+                    if let Err(err) = match &running_frame.thread_ids {
+                        Some(thread_ids) => self
                             .machine
-                            .reserve_cores_by_id(cpu_list, running_frame.request.resource_id())
+                            .reserve_cores_by_id(thread_ids, running_frame.request.resource_id())
                             .await
                             .map(|v| Some(v)),
                         None => {

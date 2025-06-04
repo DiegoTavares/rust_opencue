@@ -894,7 +894,15 @@ impl SystemManager for UnixSystem {
 
         for (phys_id, core_id) in phyid_coreid_list {
             self.save_reservation(phys_id, core_id, resource_id);
-            result.push(core_id);
+
+            let core_unique_id = format!("{}_{}", phys_id, core_id);
+            if let Some(threads) = self.threads_by_core_unique_id.get(&core_unique_id) {
+                for thread_id in threads {
+                    result.push(thread_id.clone());
+                }
+            } else {
+                warn!("Failed to find thread for coreid={}", core_id)
+            }
         }
         Ok(result)
     }

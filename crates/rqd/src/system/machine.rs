@@ -282,7 +282,7 @@ impl MachineMonitor {
                 info!("Sending frame complete report: {}", frame);
 
                 // Release resources
-                if let Some(threads) = &frame.cpu_list {
+                if let Some(threads) = &frame.thread_ids {
                     self.release_threads(threads).await;
                 } else {
                     // Ensure the division rounds up if num_cores is not a multiple of
@@ -376,14 +376,17 @@ pub trait Machine {
     ///
     /// # Arguments
     ///
-    /// * `cpu_list` - Vector of CPU core IDs to reserve
+    /// * `thread_ids` - Vector of thread ids to reserve
     /// * `resource_id` - Unique identifier for the resource that will use these cores
     ///
     /// # Returns
     ///
     /// Vector of successfully reserved CPU core IDs
-    async fn reserve_cores_by_id(&self, cpu_list: &Vec<u32>, resource_id: Uuid)
-    -> Result<Vec<u32>>;
+    async fn reserve_cores_by_id(
+        &self,
+        thread_ids: &Vec<u32>,
+        resource_id: Uuid,
+    ) -> Result<Vec<u32>>;
 
     /// Release specific threads
     ///
@@ -504,25 +507,24 @@ impl Machine for MachineMonitor {
 
     async fn reserve_cores_by_id(
         &self,
-        cpu_list: &Vec<u32>,
+        thread_ids: &Vec<u32>,
         resource_id: Uuid,
     ) -> Result<Vec<u32>> {
         // Reserve cores on the socket level
-        let cores_result = {
+        let thread_ids = {
             let mut system_lock = self.system_manager.lock().await;
             system_lock
-                .reserve_cores_by_id(cpu_list, resource_id)
+                .reserve_cores_by_id(thread_ids, resource_id)
                 .into_diagnostic()
-        };
+        }?;
 
         // Record reservation to be reported to cuebot
-        if let Ok(_) = &cores_result {
-            let mut core_state = self.core_state.lock().await;
-            core_state
-                .reserve(cpu_list.len() * self.maching_config.core_multiplier as usize)
-                .map_err(|err| miette!(err))?;
-        }
-        cores_result
+        let mut core_state = self.core_state.lock().await;
+        core_state
+            .reserve(thread_ids.len() * self.maching_config.core_multiplier as usize)
+            .map_err(|err| miette!(err))?;
+
+        Ok(thread_ids)
     }
 
     async fn release_threads(&self, thread_ids: &Vec<u32>) {

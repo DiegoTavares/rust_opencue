@@ -36,7 +36,7 @@ pub trait SystemManager {
     ///
     /// # Returns:
     ///
-    /// * Vector of core ids
+    /// * Vector of thread ids belonging to reserved cores
     fn reserve_cores(&mut self, count: usize, frame_id: Uuid)
     -> Result<Vec<u32>, ReservationError>;
 
