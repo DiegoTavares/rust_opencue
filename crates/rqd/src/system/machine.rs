@@ -363,8 +363,7 @@ pub trait Machine {
     ///
     /// # Returns
     ///
-    /// List of procs (Argument called cpu-list in the unix taskset cmd) reserved
-    /// by this request
+    /// List of threads ids belonging to the reserved cores
     async fn reserve_cores(
         &self,
         num_cores: usize,

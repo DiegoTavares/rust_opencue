@@ -92,7 +92,7 @@ pub enum ReservationError {
     ReservationNotFound(u32),
 
     #[error("Could not find core owner of this thread id")]
-    CoreNotFoundForThread(u32),
+    CoreNotFoundForThread(Vec<u32>),
 }
 
 #[derive(Debug, Clone)]
