@@ -1102,14 +1102,12 @@ impl RunningFrame {
                 stdout_result = stdout_lines.next_line() => {
                     match stdout_result {
                         Ok(Some(line)) => logger.writeln(&line),
-                        Ok(None) => break,
                         _ => {}
                     }
                 }
                 stderr_result = stderr_lines.next_line() => {
                     match stderr_result {
                         Ok(Some(line)) => logger.writeln(&line),
-                        Ok(None) => break,
                         _ => {}
                     }
                 }
