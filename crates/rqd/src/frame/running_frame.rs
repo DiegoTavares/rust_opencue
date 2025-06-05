@@ -1,10 +1,11 @@
+use std::os::unix::process::ExitStatusExt;
 use std::{
     cmp,
     collections::HashMap,
     env,
     fmt::Display,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, BufWriter, Read},
+    io::{BufReader, BufWriter, Read},
     os::{
         fd::{FromRawFd, IntoRawFd, RawFd},
         unix::process::CommandExt,
@@ -12,10 +13,9 @@ use std::{
     path::Path,
     process::ExitStatus,
     str::FromStr,
-    sync::{Arc, RwLock, mpsc::Receiver},
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime},
 };
-use std::{os::unix::process::ExitStatusExt, sync::mpsc};
 use std::{process::Stdio, thread};
 
 use bollard::{
@@ -33,7 +33,7 @@ use bytesize::KIB;
 use chrono::{DateTime, Local};
 use futures::StreamExt;
 use itertools::{Either, Itertools};
-use tokio::task::JoinHandle;
+use tokio::{io::AsyncBufReadExt, task::JoinHandle};
 use tracing::{error, info, trace, warn};
 
 use crate::{frame::frame_cmd::FrameCmdBuilder, system::manager::ProcessStats};
@@ -575,15 +575,15 @@ impl RunningFrame {
         let _ = self.snapshot();
 
         // Spawn a new thread to follow frame logs
-        let (log_pipe_handle, sender) = self.spawn_logger(logger);
+        let (log_pipe_handle, sender) = self.spawn_logger(logger).await;
 
         let output = child.wait();
         // Send a signal to the logger thread
-        if sender.send(()).is_err() {
+        if sender.send(()).await.is_err() {
             warn!("Failed to notify log thread");
         }
-        if let Err(_) = log_pipe_handle.await {
-            warn!("Failed to join log thread");
+        if let Err(err) = log_pipe_handle.await {
+            warn!("Failed to join log thread. {}", err);
         }
         let output = output
             .into_diagnostic()
@@ -838,25 +838,24 @@ impl RunningFrame {
     ///   to end.
     ///
     /// __Attention: this thread will loop forever until signalled otherwise__
-    fn spawn_logger(&self, logger: FrameLogger) -> (JoinHandle<()>, mpsc::Sender<()>) {
+    async fn spawn_logger(
+        &self,
+        logger: FrameLogger,
+    ) -> (JoinHandle<Result<()>>, tokio::sync::mpsc::Sender<()>) {
         let raw_stdout_path = self.raw_stdout_path.clone();
         let raw_stderr_path = self.raw_stderr_path.clone();
+
         // Open a oneshot channel to inform the thread it can stop reading the log
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
         // The logger thread streams the content of both stdout and stderr from
         // their raw file descriptors to the logger output. This allows augumenting its
         // content with timestamps for example.
-        let handle = tokio::task::spawn_blocking(move || {
-            if let Err(e) =
-                Self::pipe_output_to_logger(logger, &raw_stdout_path, &raw_stderr_path, receiver)
-            {
-                let msg = format!(
-                    "Failed to follow_log: {}.\nPlease check the raw stdout and stderr:\n - {}\n - {}",
-                    e, raw_stdout_path, raw_stderr_path
-                );
-                error!(msg);
-            }
-        });
+        let handle = tokio::spawn(Self::pipe_output_to_logger(
+            logger,
+            raw_stdout_path,
+            raw_stderr_path,
+            receiver,
+        ));
         (handle, sender)
     }
 
@@ -886,13 +885,13 @@ impl RunningFrame {
         ))?;
 
         // Spawn a new thread to follow frame logs
-        let (log_pipe_handle, logger_signal) = self.spawn_logger(logger);
+        let (log_pipe_handle, logger_signal) = self.spawn_logger(logger).await;
 
         info!("Frame {self} recovered with pid {pid}");
         self.wait()?;
 
         // Send a signal to the logger thread
-        if logger_signal.send(()).is_err() {
+        if logger_signal.send(()).await.is_err() {
             warn!("Failed to notify log thread");
         }
         if let Err(_) = log_pipe_handle.await {
@@ -1080,46 +1079,45 @@ impl RunningFrame {
         Ok(file.into_raw_fd())
     }
 
-    fn pipe_output_to_logger(
+    async fn pipe_output_to_logger(
         logger: FrameLogger,
-        raw_stdout_path: &String,
-        raw_stderr_path: &String,
-        stop_flag: Receiver<()>,
+        raw_stdout_path: String,
+        raw_stderr_path: String,
+        mut stop_flag: tokio::sync::mpsc::Receiver<()>,
     ) -> Result<()> {
-        let stdout_file = File::open(raw_stdout_path)
-            .map_err(|err| miette!("Failed to open raw stdout ({raw_stdout_path}). {err}"))?;
-        let mut stdout = BufReader::new(stdout_file).lines().peekable();
+        let stdout_file = tokio::fs::File::open(&raw_stdout_path)
+            .await
+            .into_diagnostic()
+            .wrap_err("Failed to open raw stdout ({raw_stdout_path})")?;
+        let stderr_file = tokio::fs::File::open(&raw_stderr_path)
+            .await
+            .into_diagnostic()
+            .wrap_err("Failed to open raw stderr ({raw_stderr_path})")?;
 
-        let stderr_file = File::open(raw_stderr_path)
-            .map_err(|err| miette!("Failed to open raw stderr ({raw_stderr_path}). {err}"))?;
-        let mut stderr = BufReader::new(stderr_file).lines().peekable();
+        let mut stdout_lines = tokio::io::BufReader::new(stdout_file).lines();
+        let mut stderr_lines = tokio::io::BufReader::new(stderr_file).lines();
 
         loop {
-            let stdout_line = stdout.next();
-            let stderr_line = stderr.next();
-
-            if stdout_line.is_none() && stderr_line.is_none() {
-                // Check if this thread has been notified the process has finished
-                if let Ok(_) = stop_flag.try_recv() {
-                    // Remove raw files as they finished being copied
-                    if let Err(err) = fs::remove_file(raw_stdout_path) {
-                        warn!("Failed to remove raw log file {}. {}", raw_stdout_path, err);
+            tokio::select! {
+                stdout_result = stdout_lines.next_line() => {
+                    match stdout_result {
+                        Ok(Some(line)) => logger.writeln(&line),
+                        Ok(None) => break,
+                        _ => {}
                     }
-                    if let Err(err) = fs::remove_file(raw_stderr_path) {
-                        warn!("Failed to remove raw log file {}. {}", raw_stderr_path, err);
-                    }
-
-                    break;
-                } else {
-                    thread::sleep(Duration::from_millis(300));
                 }
-            }
-
-            if let Some(Ok(line)) = stdout_line {
-                logger.writeln(line.as_str());
-            }
-            if let Some(Ok(line)) = stderr_line {
-                logger.writeln(line.as_str());
+                stderr_result = stderr_lines.next_line() => {
+                    match stderr_result {
+                        Ok(Some(line)) => logger.writeln(&line),
+                        Ok(None) => break,
+                        _ => {}
+                    }
+                }
+                _ = stop_flag.recv() => {
+                    let _ = tokio::fs::remove_file(raw_stdout_path).await;
+                    let _ = tokio::fs::remove_file(raw_stderr_path).await;
+                    break;
+                }
             }
         }
         Ok(())
