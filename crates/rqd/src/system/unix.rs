@@ -850,7 +850,7 @@ impl SystemManager for UnixSystem {
             let core_unique_id = format!("{}_{}", phys_id, core_id);
             if let Some(threads) = self.threads_by_core_unique_id.get(&core_unique_id) {
                 for thread_id in threads {
-                    selected_threads.push((phys_id.clone(), core_id.clone(), thread_id.clone()));
+                    selected_threads.push((phys_id, core_id, *thread_id));
                 }
                 num_reserved_cores += 1;
             } else {
@@ -1755,7 +1755,7 @@ mod tests {
         physical_cpus: u32,
         threads_per_core: u32,
     ) -> UnixSystem {
-        let mut phys_id_and_core_id_by_thread_id = HashMap::new();
+        let mut cores_by_phys_id = HashMap::new();
         let mut threads_by_core_unique_id: HashMap<String, Vec<u32>> = HashMap::new();
         let mut thread_id_lookup_table: HashMap<u32, (u32, u32)> = HashMap::new();
 
@@ -1774,12 +1774,12 @@ mod tests {
                     threads_id_counter += 1;
                 }
             }
-            phys_id_and_core_id_by_thread_id.insert(phys_id, (0..cores_per_cpu).collect());
+            cores_by_phys_id.insert(phys_id, (0..cores_per_cpu).collect());
         }
 
         UnixSystem {
             config: MachineConfig::default(),
-            cores_by_phys_id: phys_id_and_core_id_by_thread_id,
+            cores_by_phys_id,
             threads_by_core_unique_id,
             thread_id_lookup_table,
             cpu_stat: CpuStat {
