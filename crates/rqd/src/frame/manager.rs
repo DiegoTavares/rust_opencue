@@ -204,8 +204,7 @@ impl FrameManager {
         self.frame_cache
             .insert_running_frame(Arc::clone(&running_frame));
         let running_frame_ref: Arc<RunningFrame> = Arc::clone(&running_frame);
-        // Fire and forget
-        let thread_handle = std::thread::spawn(move || {
+        let thread_handle = tokio::task::spawn_blocking(move || {
             let result = std::panic::catch_unwind(|| running_frame.run(recover_mode));
             if let Err(panic_info) = result {
                 _ = running_frame.finish(1, None);

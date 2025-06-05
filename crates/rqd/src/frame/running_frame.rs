@@ -13,7 +13,6 @@ use std::{
     process::ExitStatus,
     str::FromStr,
     sync::{Arc, RwLock, mpsc::Receiver},
-    thread::JoinHandle,
     time::{Duration, SystemTime},
 };
 use std::{os::unix::process::ExitStatusExt, sync::mpsc};
@@ -34,6 +33,7 @@ use bytesize::KIB;
 use chrono::{DateTime, Local};
 use futures::StreamExt;
 use itertools::{Either, Itertools};
+use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
 
 use crate::{frame::frame_cmd::FrameCmdBuilder, system::manager::ProcessStats};
@@ -386,7 +386,7 @@ impl RunningFrame {
     ///
     /// If the process fails to spawn, it logs the error but doesn't set an exit code.
     /// The method handles both successful and failed execution scenarios.
-    pub fn run(&self, recover_mode: bool) {
+    pub async fn run(&self, recover_mode: bool) {
         let logger_base = FrameLoggerBuilder::from_logger_config(
             self.log_path.clone(),
             &self.config,
@@ -402,9 +402,9 @@ impl RunningFrame {
         let logger = Arc::new(logger_base.unwrap());
 
         let output = if recover_mode {
-            self.recover_inner(Arc::clone(&logger))
+            self.recover_inner(Arc::clone(&logger)).await
         } else {
-            self.run_inner(Arc::clone(&logger))
+            self.run_inner(Arc::clone(&logger)).await
         };
         let was_spawned = match output {
             Ok((exit_code, exit_signal)) => {
@@ -462,7 +462,7 @@ impl RunningFrame {
         let logger = Arc::new(logger_base.unwrap());
 
         let exit_code = if recover_mode {
-            match self.recover_inner(Arc::clone(&logger)) {
+            match self.recover_inner(Arc::clone(&logger)).await {
                 Ok((exit_code, exit_signal)) => {
                     if let Err(err) = self.finish(exit_code, exit_signal) {
                         warn!("Failed to mark frame {} as finished. {}", self, err);
@@ -511,7 +511,7 @@ impl RunningFrame {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn run_inner(&self, logger: FrameLogger) -> Result<(i32, Option<i32>)> {
+    async fn run_inner(&self, logger: FrameLogger) -> Result<(i32, Option<i32>)> {
         use nix::libc;
 
         logger.writeln(self.write_header().as_str());
@@ -582,7 +582,7 @@ impl RunningFrame {
         if sender.send(()).is_err() {
             warn!("Failed to notify log thread");
         }
-        if let Err(_) = log_pipe_handle.join() {
+        if let Err(_) = log_pipe_handle.await {
             warn!("Failed to join log thread");
         }
         let output = output
@@ -846,7 +846,7 @@ impl RunningFrame {
         // The logger thread streams the content of both stdout and stderr from
         // their raw file descriptors to the logger output. This allows augumenting its
         // content with timestamps for example.
-        let handle = thread::spawn(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             if let Err(e) =
                 Self::pipe_output_to_logger(logger, &raw_stdout_path, &raw_stderr_path, receiver)
             {
@@ -877,7 +877,7 @@ impl RunningFrame {
     /// # Errors
     /// Returns an error if the frame doesn't have a valid PID or if process monitoring fails
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn recover_inner(&self, logger: FrameLogger) -> Result<(i32, Option<i32>)> {
+    async fn recover_inner(&self, logger: FrameLogger) -> Result<(i32, Option<i32>)> {
         logger.writeln(self.write_header().as_str());
 
         let pid = self.pid().ok_or(miette!(
@@ -895,7 +895,7 @@ impl RunningFrame {
         if logger_signal.send(()).is_err() {
             warn!("Failed to notify log thread");
         }
-        if let Err(_) = log_pipe_handle.join() {
+        if let Err(_) = log_pipe_handle.await {
             warn!("Failed to join log thread");
         }
 
@@ -1485,9 +1485,9 @@ mod tests {
         )
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_logs_stdout_stderr() {
+    async fn test_run_logs_stdout_stderr() {
         let mut env = HashMap::with_capacity(1);
         env.insert("TEST_ENV".to_string(), "test".to_string());
         let running_frame = create_running_frame(
@@ -1499,7 +1499,8 @@ mod tests {
 
         let logger = Arc::new(TestLogger::init());
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
         assert_eq!("stderr test", logger.pop().unwrap());
@@ -1511,24 +1512,25 @@ mod tests {
         assert_eq!((0, None), status.unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_failed() {
+    async fn test_run_failed() {
         let mut env = HashMap::with_capacity(1);
         env.insert("TEST_ENV".to_string(), "test".to_string());
         let running_frame = create_running_frame(r#"echo "stdout $TEST_ENV" && exit 1"#, 1, 1, env);
 
         let logger = Arc::new(TestLogger::init());
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         assert!(status.is_ok());
         assert_eq!((1, None), status.unwrap());
         assert_eq!("stdout test", logger.pop().unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_multiline_stdout() {
+    async fn test_run_multiline_stdout() {
         let running_frame = create_running_frame(
             r#"echo "line1" && echo "line2" && echo "line3""#,
             1,
@@ -1538,7 +1540,8 @@ mod tests {
 
         let logger = Arc::new(TestLogger::init());
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
         assert_eq!("line3", logger.pop().unwrap());
@@ -1551,9 +1554,9 @@ mod tests {
         assert_eq!((0, None), status.unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_env_variables() {
+    async fn test_run_env_variables() {
         let mut env = HashMap::new();
         env.insert("VAR1".to_string(), "value1".to_string());
         env.insert("VAR2".to_string(), "value2".to_string());
@@ -1562,7 +1565,8 @@ mod tests {
 
         let logger = Arc::new(TestLogger::init());
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
         assert_eq!("value1 value2", logger.pop().unwrap());
@@ -1573,15 +1577,16 @@ mod tests {
         assert_eq!((0, None), status.unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_command_not_found() {
+    async fn test_run_command_not_found() {
         let running_frame =
             create_running_frame(r#"command_that_does_not_exist"#, 1, 1, HashMap::new());
 
         let logger = Arc::new(TestLogger::init());
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         assert!(status.is_ok());
         // The exact exit code might vary by system, but it should be non-zero
         assert_ne!((0, None), status.unwrap());
@@ -1592,9 +1597,9 @@ mod tests {
         assert_ne!((0, None), status.unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_sleep_command() {
+    async fn test_run_sleep_command() {
         use std::time::{Duration, Instant};
 
         let running_frame =
@@ -1603,7 +1608,8 @@ mod tests {
         let logger = Arc::new(TestLogger::init());
         let start = Instant::now();
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         let elapsed = start.elapsed();
 
         assert!(status.is_ok());
@@ -1620,9 +1626,9 @@ mod tests {
         assert_eq!((0, None), status.unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_interleaved_stdout_stderr() {
+    async fn test_run_interleaved_stdout_stderr() {
         let running_frame = create_running_frame(
             r#"echo "stdout1" && echo "stderr1" >&2 && echo "stdout2" && echo "stderr2" >&2"#,
             1,
@@ -1632,7 +1638,8 @@ mod tests {
 
         let logger = Arc::new(TestLogger::init());
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
 
