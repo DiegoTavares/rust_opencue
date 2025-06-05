@@ -1015,7 +1015,7 @@ impl RunningFrame {
             match signal::kill(nix_pid, None) {
                 Ok(_) => {
                     // Process still running, wait a bit and check again
-                    thread::sleep(Duration::from_millis(500));
+                    thread::sleep(Duration::from_millis(1500));
                 }
                 Err(nix::Error::ESRCH) => {
                     // Process has exited
