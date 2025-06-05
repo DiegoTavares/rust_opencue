@@ -6,7 +6,7 @@ use opencue_proto::{
 };
 use std::{fs, sync::Arc, time::SystemTime};
 use thiserror::Error;
-use tokio::time;
+use tokio::{runtime::Handle, time};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -205,14 +205,8 @@ impl FrameManager {
             .insert_running_frame(Arc::clone(&running_frame));
         let running_frame_ref: Arc<RunningFrame> = Arc::clone(&running_frame);
         let thread_handle = tokio::task::spawn_blocking(move || {
-            let result = std::panic::catch_unwind(|| running_frame.run(recover_mode));
-            if let Err(panic_info) = result {
-                _ = running_frame.finish(1, None);
-                error!(
-                    "Run thread panicked for {}: {:?}",
-                    running_frame, panic_info
-                );
-            }
+            let handle = Handle::current();
+            handle.block_on(async { running_frame.run(recover_mode).await });
         });
         if let Err(err) = running_frame_ref.update_launch_thread_handle(thread_handle) {
             warn!(
