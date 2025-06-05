@@ -2,7 +2,6 @@ use std::{str::FromStr, sync::Arc};
 
 use config::config::Config;
 use frame::{cache::RunningFrameCache, manager::FrameManager};
-use miette::IntoDiagnostic;
 use report::report_client::ReportClient;
 use system::machine::MachineMonitor;
 use tokio::select;
