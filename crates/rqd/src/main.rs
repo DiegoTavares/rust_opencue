@@ -15,7 +15,7 @@ mod report;
 mod servant;
 mod system;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 12)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> miette::Result<()> {
     let config = Config::load()?;
 
