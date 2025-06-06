@@ -216,9 +216,8 @@ impl FrameManager {
     fn spawn_docker_frame(&self, running_frame: Arc<RunningFrame>, recovery_mode: bool) {
         self.frame_cache
             .insert_running_frame(Arc::clone(&running_frame));
-        let _thread_handle = tokio::task::spawn_blocking(async move || {
-            running_frame.run_docker(recovery_mode).await
-        });
+        let _thread_handle =
+            tokio::spawn(async move { running_frame.run_docker(recovery_mode).await });
     }
 
     fn validate_grpc_frame(&self, run_frame: &RunFrame) -> Result<(), FrameManagerError> {

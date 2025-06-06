@@ -737,7 +737,6 @@ impl RunningFrame {
             Ok(pid) => pid,
             Err(err) => {
                 // Clean up container before returning the error
-                // Use tokio::spawn to handle the async operation without blocking
                 let _ = docker.remove_container(&container_name, None).await;
                 return Err(err);
             }
