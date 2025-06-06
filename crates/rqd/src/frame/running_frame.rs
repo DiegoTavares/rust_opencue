@@ -1,4 +1,4 @@
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::{
     cmp,
@@ -1078,7 +1078,8 @@ impl RunningFrame {
             .open(path)
             .await
             .into_diagnostic()?;
-        Ok(file.as_raw_fd())
+
+        Ok(file.into_std().await.into_raw_fd())
     }
 
     async fn pipe_output_to_logger(
