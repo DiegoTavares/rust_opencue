@@ -1,4 +1,4 @@
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::IntoRawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::{
     cmp,
