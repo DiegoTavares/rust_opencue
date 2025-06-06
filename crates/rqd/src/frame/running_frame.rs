@@ -1,12 +1,12 @@
+use std::os::fd::AsRawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::{
     cmp,
     collections::HashMap,
     env,
     fmt::Display,
-    fs::{self, OpenOptions},
     io::BufReader,
-    os::fd::{FromRawFd, IntoRawFd, RawFd},
+    os::fd::{FromRawFd, RawFd},
     path::Path,
     process::ExitStatus,
     str::FromStr,
@@ -423,7 +423,7 @@ impl RunningFrame {
                 false
             }
         };
-        if let Err(err) = self.clear_snapshot() {
+        if let Err(err) = self.clear_snapshot().await {
             // Only warn if a job was actually launched
             if was_spawned {
                 warn!(
@@ -497,7 +497,7 @@ impl RunningFrame {
                 }
             }
         };
-        if let Err(err) = self.clear_snapshot() {
+        if let Err(err) = self.clear_snapshot().await {
             // Only warn if a job was actually launched
             if exit_code.is_some() {
                 warn!(
@@ -523,8 +523,8 @@ impl RunningFrame {
         if let Some(cpu_list) = &self.thread_ids {
             command.with_taskset(cpu_list.clone());
         }
-        let raw_stdout = Self::setup_raw_fd(&self.raw_stdout_path)?;
-        let raw_stderr = Self::setup_raw_fd(&self.raw_stderr_path)?;
+        let raw_stdout = Self::setup_raw_fd(&self.raw_stdout_path).await?;
+        let raw_stderr = Self::setup_raw_fd(&self.raw_stderr_path).await?;
 
         let (cmd, cmd_str) = command
             .with_frame_cmd(self.request.command.clone())
@@ -573,7 +573,7 @@ impl RunningFrame {
         );
 
         // Make sure process has been spawned before creating a backup
-        let _ = self.snapshot();
+        let _ = self.create_snapshot().await;
 
         // Spawn a new thread to follow frame logs
         let (log_pipe_handle, sender) = self.spawn_logger(logger).await;
@@ -751,7 +751,7 @@ impl RunningFrame {
             self.taskset()
         );
 
-        let _ = self.snapshot();
+        let _ = self.create_snapshot().await;
         let log_watcher_handle = tokio::task::spawn(async move {
             while let Some(Ok(output)) = log_stream.next().await {
                 logger.write(output.into_bytes().as_ref());
@@ -1070,14 +1070,15 @@ impl RunningFrame {
         }
     }
 
-    fn setup_raw_fd(path: &str) -> Result<RawFd> {
-        let file = OpenOptions::new()
+    async fn setup_raw_fd(path: &str) -> Result<RawFd> {
+        let file = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .append(true)
             .open(path)
+            .await
             .into_diagnostic()?;
-        Ok(file.into_raw_fd())
+        Ok(file.as_raw_fd())
     }
 
     async fn pipe_output_to_logger(
@@ -1136,7 +1137,7 @@ impl RunningFrame {
     /// Save a snapshot of the frame into disk to enable recovering its status in case
     /// rqd restarts.
     ///
-    async fn snapshot(&self) -> Result<()> {
+    async fn create_snapshot(&self) -> Result<()> {
         let snapshot_path = self.snapshot_path()?;
         let file = File::create(&snapshot_path).await.into_diagnostic()?;
         let mut writer = BufWriter::new(file);
@@ -1152,9 +1153,11 @@ impl RunningFrame {
         Ok(())
     }
 
-    fn clear_snapshot(&self) -> Result<()> {
+    async fn clear_snapshot(&self) -> Result<()> {
         let snapshot_path = self.snapshot_path()?;
-        fs::remove_file(snapshot_path).into_diagnostic()
+        tokio::fs::remove_file(snapshot_path)
+            .await
+            .into_diagnostic()
     }
 
     /// Load a frame from a snapshot file
