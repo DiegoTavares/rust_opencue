@@ -6,7 +6,7 @@ use opencue_proto::{
 };
 use std::{fs, sync::Arc, time::SystemTime};
 use thiserror::Error;
-use tokio::{runtime::Handle, time};
+use tokio::time;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -204,10 +204,7 @@ impl FrameManager {
         self.frame_cache
             .insert_running_frame(Arc::clone(&running_frame));
         let running_frame_ref: Arc<RunningFrame> = Arc::clone(&running_frame);
-        let thread_handle = tokio::task::spawn_blocking(move || {
-            let handle = Handle::current();
-            handle.block_on(async { running_frame.run(recover_mode).await });
-        });
+        let thread_handle = tokio::spawn(async move { running_frame.run(recover_mode).await });
         if let Err(err) = running_frame_ref.update_launch_thread_handle(thread_handle) {
             warn!(
                 "Failed to update thread handle for frame {}. {}",

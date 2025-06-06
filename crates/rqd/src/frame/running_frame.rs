@@ -4,12 +4,9 @@ use std::{
     collections::HashMap,
     env,
     fmt::Display,
-    fs::{self, File, OpenOptions},
-    io::{BufReader, BufWriter, Read},
-    os::{
-        fd::{FromRawFd, IntoRawFd, RawFd},
-        unix::process::CommandExt,
-    },
+    fs::{self, OpenOptions},
+    io::BufReader,
+    os::fd::{FromRawFd, IntoRawFd, RawFd},
     path::Path,
     process::ExitStatus,
     str::FromStr,
@@ -33,6 +30,8 @@ use bytesize::KIB;
 use chrono::{DateTime, Local};
 use futures::StreamExt;
 use itertools::{Either, Itertools};
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::{io::AsyncBufReadExt, task::JoinHandle};
 use tracing::{error, info, trace, warn};
 
@@ -563,8 +562,10 @@ impl RunningFrame {
         })?;
 
         // Update frame state with frame pid
-        let pid = child.id();
-        self.start(child.id());
+        let pid = child.id().ok_or(miette!(
+            "Invalid State, trying to get pid of a process that has already terminated"
+        ))?;
+        self.start(pid);
 
         info!(
             "Frame {self} started with pid {pid}, with taskset {}",
@@ -577,7 +578,7 @@ impl RunningFrame {
         // Spawn a new thread to follow frame logs
         let (log_pipe_handle, sender) = self.spawn_logger(logger).await;
 
-        let output = child.wait();
+        let output = child.wait().await;
         // Send a signal to the logger thread
         if sender.send(()).await.is_err() {
             warn!("Failed to notify log thread");
@@ -902,7 +903,7 @@ impl RunningFrame {
 
         // If a recovered frame fails to read the exit code from
         // the exit file, mark the frame as killed (SIGTERM)
-        Ok(self.read_exit_file().unwrap_or((1, Some(143))))
+        Ok(self.read_exit_file().await.unwrap_or((1, Some(143))))
     }
 
     /// Get the process ID (PID) of the running frame process
@@ -942,8 +943,8 @@ impl RunningFrame {
     /// Returns an error if:
     /// - The exit file cannot be opened or read
     /// - The content of the exit file cannot be parsed as an integer
-    pub(self) fn read_exit_file(&self) -> Result<(i32, Option<i32>)> {
-        let mut file = File::open(&self.exit_file_path).map_err(|err| {
+    pub(self) async fn read_exit_file(&self) -> Result<(i32, Option<i32>)> {
+        let mut file = File::open(&self.exit_file_path).await.map_err(|err| {
             let msg = format!(
                 "Failed to open exit_file({}) when recovering frame {}. {}",
                 self.exit_file_path, self, err
@@ -952,7 +953,7 @@ impl RunningFrame {
             miette!(msg)
         })?;
         let mut buffer = String::new();
-        file.read_to_string(&mut buffer).map_err(|err| {
+        file.read_to_string(&mut buffer).await.map_err(|err| {
             let msg = format!(
                 "Failed to read exit_file({}) when recovering frame {}. {}",
                 self.exit_file_path, self, err
@@ -1135,14 +1136,19 @@ impl RunningFrame {
     /// Save a snapshot of the frame into disk to enable recovering its status in case
     /// rqd restarts.
     ///
-    fn snapshot(&self) -> Result<()> {
+    async fn snapshot(&self) -> Result<()> {
         let snapshot_path = self.snapshot_path()?;
-        let file = File::create(&snapshot_path).into_diagnostic()?;
-        let writer = BufWriter::new(file);
+        let file = File::create(&snapshot_path).await.into_diagnostic()?;
+        let mut writer = BufWriter::new(file);
 
-        bincode::serialize_into(writer, self)
+        let serialized_data = bincode::serialize(self)
             .into_diagnostic()
             .map_err(|e| miette!("Failed to serialize frame snapshot: {}", e))?;
+        writer
+            .write(&serialized_data)
+            .await
+            .into_diagnostic()
+            .map_err(|e| miette!("Failed to write frame snapshot: {}", e))?;
         Ok(())
     }
 
@@ -1179,8 +1185,8 @@ impl RunningFrame {
     /// the snapshot is binding to the correct process
     ///
     pub fn from_snapshot(path: &str, config: RunnerConfig) -> Result<Self> {
-        let file =
-            File::open(path).map_err(|err| miette!("Failed to open snapshot file. {}", err))?;
+        let file = std::fs::File::open(path)
+            .map_err(|err| miette!("Failed to open snapshot file. {}", err))?;
         let reader = BufReader::new(file);
 
         let mut frame: RunningFrame = bincode::deserialize_from(reader)
@@ -1503,7 +1509,7 @@ mod tests {
         assert_eq!("stdout test", logger.pop().unwrap());
 
         // Assert the output on the exit_file is the same
-        let status = running_frame.read_exit_file();
+        let status = running_frame.read_exit_file().await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
     }
@@ -1545,7 +1551,7 @@ mod tests {
         assert_eq!("line1", logger.pop().unwrap());
 
         // Assert the output on the exit_file is the same
-        let status = running_frame.read_exit_file();
+        let status = running_frame.read_exit_file().await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
     }
@@ -1568,7 +1574,7 @@ mod tests {
         assert_eq!("value1 value2", logger.pop().unwrap());
 
         // Assert the output on the exit_file is the same
-        let status = running_frame.read_exit_file();
+        let status = running_frame.read_exit_file().await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
     }
@@ -1588,7 +1594,7 @@ mod tests {
         assert_ne!((0, None), status.unwrap());
 
         // Assert the output on the exit_file is the same
-        let status = running_frame.read_exit_file();
+        let status = running_frame.read_exit_file().await;
         assert!(status.is_ok());
         assert_ne!((0, None), status.unwrap());
     }
@@ -1617,7 +1623,7 @@ mod tests {
         assert_eq!("Done sleeping", logger.pop().unwrap());
 
         // Assert the output on the exit_file is the same
-        let status = running_frame.read_exit_file();
+        let status = running_frame.read_exit_file().await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
     }
@@ -1646,7 +1652,7 @@ mod tests {
         assert!(logs.contains(&"stderr2".to_string()));
 
         // Assert the output on the exit_file is the same
-        let status = running_frame.read_exit_file();
+        let status = running_frame.read_exit_file().await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
     }
