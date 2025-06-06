@@ -1,22 +1,18 @@
+use std::os::fd::IntoRawFd;
+use std::os::unix::process::ExitStatusExt;
 use std::{
     cmp,
     collections::HashMap,
     env,
     fmt::Display,
-    fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, BufWriter, Read},
-    os::{
-        fd::{FromRawFd, IntoRawFd, RawFd},
-        unix::process::CommandExt,
-    },
+    io::BufReader,
+    os::fd::{FromRawFd, RawFd},
     path::Path,
     process::ExitStatus,
     str::FromStr,
-    sync::{Arc, RwLock, mpsc::Receiver},
-    thread::JoinHandle,
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime},
 };
-use std::{os::unix::process::ExitStatusExt, sync::mpsc};
 use std::{process::Stdio, thread};
 
 use bollard::{
@@ -34,6 +30,9 @@ use bytesize::KIB;
 use chrono::{DateTime, Local};
 use futures::StreamExt;
 use itertools::{Either, Itertools};
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::{io::AsyncBufReadExt, task::JoinHandle};
 use tracing::{error, info, trace, warn};
 
 use crate::{frame::frame_cmd::FrameCmdBuilder, system::manager::ProcessStats};
@@ -386,7 +385,7 @@ impl RunningFrame {
     ///
     /// If the process fails to spawn, it logs the error but doesn't set an exit code.
     /// The method handles both successful and failed execution scenarios.
-    pub fn run(&self, recover_mode: bool) {
+    pub async fn run(&self, recover_mode: bool) {
         let logger_base = FrameLoggerBuilder::from_logger_config(
             self.log_path.clone(),
             &self.config,
@@ -402,9 +401,9 @@ impl RunningFrame {
         let logger = Arc::new(logger_base.unwrap());
 
         let output = if recover_mode {
-            self.recover_inner(Arc::clone(&logger))
+            self.recover_inner(Arc::clone(&logger)).await
         } else {
-            self.run_inner(Arc::clone(&logger))
+            self.run_inner(Arc::clone(&logger)).await
         };
         let was_spawned = match output {
             Ok((exit_code, exit_signal)) => {
@@ -424,7 +423,7 @@ impl RunningFrame {
                 false
             }
         };
-        if let Err(err) = self.clear_snapshot() {
+        if let Err(err) = self.clear_snapshot().await {
             // Only warn if a job was actually launched
             if was_spawned {
                 warn!(
@@ -462,7 +461,7 @@ impl RunningFrame {
         let logger = Arc::new(logger_base.unwrap());
 
         let exit_code = if recover_mode {
-            match self.recover_inner(Arc::clone(&logger)) {
+            match self.recover_inner(Arc::clone(&logger)).await {
                 Ok((exit_code, exit_signal)) => {
                     if let Err(err) = self.finish(exit_code, exit_signal) {
                         warn!("Failed to mark frame {} as finished. {}", self, err);
@@ -498,7 +497,7 @@ impl RunningFrame {
                 }
             }
         };
-        if let Err(err) = self.clear_snapshot() {
+        if let Err(err) = self.clear_snapshot().await {
             // Only warn if a job was actually launched
             if exit_code.is_some() {
                 warn!(
@@ -511,7 +510,7 @@ impl RunningFrame {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn run_inner(&self, logger: FrameLogger) -> Result<(i32, Option<i32>)> {
+    async fn run_inner(&self, logger: FrameLogger) -> Result<(i32, Option<i32>)> {
         use nix::libc;
 
         logger.writeln(self.write_header().as_str());
@@ -524,8 +523,8 @@ impl RunningFrame {
         if let Some(cpu_list) = &self.thread_ids {
             command.with_taskset(cpu_list.clone());
         }
-        let raw_stdout = Self::setup_raw_fd(&self.raw_stdout_path)?;
-        let raw_stderr = Self::setup_raw_fd(&self.raw_stderr_path)?;
+        let raw_stdout = Self::setup_raw_fd(&self.raw_stdout_path).await?;
+        let raw_stderr = Self::setup_raw_fd(&self.raw_stderr_path).await?;
 
         let (cmd, cmd_str) = command
             .with_frame_cmd(self.request.command.clone())
@@ -563,8 +562,10 @@ impl RunningFrame {
         })?;
 
         // Update frame state with frame pid
-        let pid = child.id();
-        self.start(child.id());
+        let pid = child.id().ok_or(miette!(
+            "Invalid State, trying to get pid of a process that has already terminated"
+        ))?;
+        self.start(pid);
 
         info!(
             "Frame {self} started with pid {pid}, with taskset {}",
@@ -572,18 +573,18 @@ impl RunningFrame {
         );
 
         // Make sure process has been spawned before creating a backup
-        let _ = self.snapshot();
+        let _ = self.create_snapshot().await;
 
         // Spawn a new thread to follow frame logs
-        let (log_pipe_handle, sender) = self.spawn_logger(logger);
+        let (log_pipe_handle, sender) = self.spawn_logger(logger).await;
 
-        let output = child.wait();
+        let output = child.wait().await;
         // Send a signal to the logger thread
-        if sender.send(()).is_err() {
+        if sender.send(()).await.is_err() {
             warn!("Failed to notify log thread");
         }
-        if let Err(_) = log_pipe_handle.join() {
-            warn!("Failed to join log thread");
+        if let Err(err) = log_pipe_handle.await {
+            warn!("Failed to join log thread. {}", err);
         }
         let output = output
             .into_diagnostic()
@@ -750,7 +751,7 @@ impl RunningFrame {
             self.taskset()
         );
 
-        let _ = self.snapshot();
+        let _ = self.create_snapshot().await;
         let log_watcher_handle = tokio::task::spawn(async move {
             while let Some(Ok(output)) = log_stream.next().await {
                 logger.write(output.into_bytes().as_ref());
@@ -838,25 +839,24 @@ impl RunningFrame {
     ///   to end.
     ///
     /// __Attention: this thread will loop forever until signalled otherwise__
-    fn spawn_logger(&self, logger: FrameLogger) -> (JoinHandle<()>, mpsc::Sender<()>) {
+    async fn spawn_logger(
+        &self,
+        logger: FrameLogger,
+    ) -> (JoinHandle<Result<()>>, tokio::sync::mpsc::Sender<()>) {
         let raw_stdout_path = self.raw_stdout_path.clone();
         let raw_stderr_path = self.raw_stderr_path.clone();
+
         // Open a oneshot channel to inform the thread it can stop reading the log
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
         // The logger thread streams the content of both stdout and stderr from
         // their raw file descriptors to the logger output. This allows augumenting its
         // content with timestamps for example.
-        let handle = thread::spawn(move || {
-            if let Err(e) =
-                Self::pipe_output_to_logger(logger, &raw_stdout_path, &raw_stderr_path, receiver)
-            {
-                let msg = format!(
-                    "Failed to follow_log: {}.\nPlease check the raw stdout and stderr:\n - {}\n - {}",
-                    e, raw_stdout_path, raw_stderr_path
-                );
-                error!(msg);
-            }
-        });
+        let handle = tokio::spawn(Self::pipe_output_to_logger(
+            logger,
+            raw_stdout_path,
+            raw_stderr_path,
+            receiver,
+        ));
         (handle, sender)
     }
 
@@ -877,7 +877,7 @@ impl RunningFrame {
     /// # Errors
     /// Returns an error if the frame doesn't have a valid PID or if process monitoring fails
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn recover_inner(&self, logger: FrameLogger) -> Result<(i32, Option<i32>)> {
+    async fn recover_inner(&self, logger: FrameLogger) -> Result<(i32, Option<i32>)> {
         logger.writeln(self.write_header().as_str());
 
         let pid = self.pid().ok_or(miette!(
@@ -886,16 +886,16 @@ impl RunningFrame {
         ))?;
 
         // Spawn a new thread to follow frame logs
-        let (log_pipe_handle, logger_signal) = self.spawn_logger(logger);
+        let (log_pipe_handle, logger_signal) = self.spawn_logger(logger).await;
 
         info!("Frame {self} recovered with pid {pid}");
         self.wait()?;
 
         // Send a signal to the logger thread
-        if logger_signal.send(()).is_err() {
+        if logger_signal.send(()).await.is_err() {
             warn!("Failed to notify log thread");
         }
-        if let Err(_) = log_pipe_handle.join() {
+        if let Err(_) = log_pipe_handle.await {
             warn!("Failed to join log thread");
         }
 
@@ -903,7 +903,7 @@ impl RunningFrame {
 
         // If a recovered frame fails to read the exit code from
         // the exit file, mark the frame as killed (SIGTERM)
-        Ok(self.read_exit_file().unwrap_or((1, Some(143))))
+        Ok(self.read_exit_file().await.unwrap_or((1, Some(143))))
     }
 
     /// Get the process ID (PID) of the running frame process
@@ -943,8 +943,8 @@ impl RunningFrame {
     /// Returns an error if:
     /// - The exit file cannot be opened or read
     /// - The content of the exit file cannot be parsed as an integer
-    pub(self) fn read_exit_file(&self) -> Result<(i32, Option<i32>)> {
-        let mut file = File::open(&self.exit_file_path).map_err(|err| {
+    pub(self) async fn read_exit_file(&self) -> Result<(i32, Option<i32>)> {
+        let mut file = File::open(&self.exit_file_path).await.map_err(|err| {
             let msg = format!(
                 "Failed to open exit_file({}) when recovering frame {}. {}",
                 self.exit_file_path, self, err
@@ -953,7 +953,7 @@ impl RunningFrame {
             miette!(msg)
         })?;
         let mut buffer = String::new();
-        file.read_to_string(&mut buffer).map_err(|err| {
+        file.read_to_string(&mut buffer).await.map_err(|err| {
             let msg = format!(
                 "Failed to read exit_file({}) when recovering frame {}. {}",
                 self.exit_file_path, self, err
@@ -1016,7 +1016,7 @@ impl RunningFrame {
             match signal::kill(nix_pid, None) {
                 Ok(_) => {
                     // Process still running, wait a bit and check again
-                    thread::sleep(Duration::from_millis(500));
+                    thread::sleep(Duration::from_millis(1500));
                 }
                 Err(nix::Error::ESRCH) => {
                     // Process has exited
@@ -1070,56 +1070,55 @@ impl RunningFrame {
         }
     }
 
-    fn setup_raw_fd(path: &str) -> Result<RawFd> {
-        let file = OpenOptions::new()
+    async fn setup_raw_fd(path: &str) -> Result<RawFd> {
+        let file = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .append(true)
             .open(path)
+            .await
             .into_diagnostic()?;
-        Ok(file.into_raw_fd())
+
+        Ok(file.into_std().await.into_raw_fd())
     }
 
-    fn pipe_output_to_logger(
+    async fn pipe_output_to_logger(
         logger: FrameLogger,
-        raw_stdout_path: &String,
-        raw_stderr_path: &String,
-        stop_flag: Receiver<()>,
+        raw_stdout_path: String,
+        raw_stderr_path: String,
+        mut stop_flag: tokio::sync::mpsc::Receiver<()>,
     ) -> Result<()> {
-        let stdout_file = File::open(raw_stdout_path)
-            .map_err(|err| miette!("Failed to open raw stdout ({raw_stdout_path}). {err}"))?;
-        let mut stdout = BufReader::new(stdout_file).lines().peekable();
+        let stdout_file = tokio::fs::File::open(&raw_stdout_path)
+            .await
+            .into_diagnostic()
+            .wrap_err("Failed to open raw stdout ({raw_stdout_path})")?;
+        let stderr_file = tokio::fs::File::open(&raw_stderr_path)
+            .await
+            .into_diagnostic()
+            .wrap_err("Failed to open raw stderr ({raw_stderr_path})")?;
 
-        let stderr_file = File::open(raw_stderr_path)
-            .map_err(|err| miette!("Failed to open raw stderr ({raw_stderr_path}). {err}"))?;
-        let mut stderr = BufReader::new(stderr_file).lines().peekable();
+        let mut stdout_lines = tokio::io::BufReader::new(stdout_file).lines();
+        let mut stderr_lines = tokio::io::BufReader::new(stderr_file).lines();
 
         loop {
-            let stdout_line = stdout.next();
-            let stderr_line = stderr.next();
-
-            if stdout_line.is_none() && stderr_line.is_none() {
-                // Check if this thread has been notified the process has finished
-                if let Ok(_) = stop_flag.try_recv() {
-                    // Remove raw files as they finished being copied
-                    if let Err(err) = fs::remove_file(raw_stdout_path) {
-                        warn!("Failed to remove raw log file {}. {}", raw_stdout_path, err);
+            tokio::select! {
+                stdout_result = stdout_lines.next_line() => {
+                    match stdout_result {
+                        Ok(Some(line)) => logger.writeln(&line),
+                        _ => {}
                     }
-                    if let Err(err) = fs::remove_file(raw_stderr_path) {
-                        warn!("Failed to remove raw log file {}. {}", raw_stderr_path, err);
-                    }
-
-                    break;
-                } else {
-                    thread::sleep(Duration::from_millis(300));
                 }
-            }
-
-            if let Some(Ok(line)) = stdout_line {
-                logger.writeln(line.as_str());
-            }
-            if let Some(Ok(line)) = stderr_line {
-                logger.writeln(line.as_str());
+                stderr_result = stderr_lines.next_line() => {
+                    match stderr_result {
+                        Ok(Some(line)) => logger.writeln(&line),
+                        _ => {}
+                    }
+                }
+                _ = stop_flag.recv() => {
+                    let _ = tokio::fs::remove_file(raw_stdout_path).await;
+                    let _ = tokio::fs::remove_file(raw_stderr_path).await;
+                    break;
+                }
             }
         }
         Ok(())
@@ -1139,20 +1138,27 @@ impl RunningFrame {
     /// Save a snapshot of the frame into disk to enable recovering its status in case
     /// rqd restarts.
     ///
-    fn snapshot(&self) -> Result<()> {
+    async fn create_snapshot(&self) -> Result<()> {
         let snapshot_path = self.snapshot_path()?;
-        let file = File::create(&snapshot_path).into_diagnostic()?;
-        let writer = BufWriter::new(file);
+        let file = File::create(&snapshot_path).await.into_diagnostic()?;
+        let mut writer = BufWriter::new(file);
 
-        bincode::serialize_into(writer, self)
+        let serialized_data = bincode::serialize(self)
             .into_diagnostic()
             .map_err(|e| miette!("Failed to serialize frame snapshot: {}", e))?;
+        writer
+            .write(&serialized_data)
+            .await
+            .into_diagnostic()
+            .map_err(|e| miette!("Failed to write frame snapshot: {}", e))?;
         Ok(())
     }
 
-    fn clear_snapshot(&self) -> Result<()> {
+    async fn clear_snapshot(&self) -> Result<()> {
         let snapshot_path = self.snapshot_path()?;
-        fs::remove_file(snapshot_path).into_diagnostic()
+        tokio::fs::remove_file(snapshot_path)
+            .await
+            .into_diagnostic()
     }
 
     /// Load a frame from a snapshot file
@@ -1183,8 +1189,8 @@ impl RunningFrame {
     /// the snapshot is binding to the correct process
     ///
     pub fn from_snapshot(path: &str, config: RunnerConfig) -> Result<Self> {
-        let file =
-            File::open(path).map_err(|err| miette!("Failed to open snapshot file. {}", err))?;
+        let file = std::fs::File::open(path)
+            .map_err(|err| miette!("Failed to open snapshot file. {}", err))?;
         let reader = BufReader::new(file);
 
         let mut frame: RunningFrame = bincode::deserialize_from(reader)
@@ -1485,9 +1491,9 @@ mod tests {
         )
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_logs_stdout_stderr() {
+    async fn test_run_logs_stdout_stderr() {
         let mut env = HashMap::with_capacity(1);
         env.insert("TEST_ENV".to_string(), "test".to_string());
         let running_frame = create_running_frame(
@@ -1499,36 +1505,38 @@ mod tests {
 
         let logger = Arc::new(TestLogger::init());
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
         assert_eq!("stderr test", logger.pop().unwrap());
         assert_eq!("stdout test", logger.pop().unwrap());
 
         // Assert the output on the exit_file is the same
-        let status = running_frame.read_exit_file();
+        let status = running_frame.read_exit_file().await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_failed() {
+    async fn test_run_failed() {
         let mut env = HashMap::with_capacity(1);
         env.insert("TEST_ENV".to_string(), "test".to_string());
         let running_frame = create_running_frame(r#"echo "stdout $TEST_ENV" && exit 1"#, 1, 1, env);
 
         let logger = Arc::new(TestLogger::init());
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         assert!(status.is_ok());
         assert_eq!((1, None), status.unwrap());
         assert_eq!("stdout test", logger.pop().unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_multiline_stdout() {
+    async fn test_run_multiline_stdout() {
         let running_frame = create_running_frame(
             r#"echo "line1" && echo "line2" && echo "line3""#,
             1,
@@ -1538,7 +1546,8 @@ mod tests {
 
         let logger = Arc::new(TestLogger::init());
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
         assert_eq!("line3", logger.pop().unwrap());
@@ -1546,14 +1555,14 @@ mod tests {
         assert_eq!("line1", logger.pop().unwrap());
 
         // Assert the output on the exit_file is the same
-        let status = running_frame.read_exit_file();
+        let status = running_frame.read_exit_file().await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_env_variables() {
+    async fn test_run_env_variables() {
         let mut env = HashMap::new();
         env.insert("VAR1".to_string(), "value1".to_string());
         env.insert("VAR2".to_string(), "value2".to_string());
@@ -1562,39 +1571,41 @@ mod tests {
 
         let logger = Arc::new(TestLogger::init());
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
         assert_eq!("value1 value2", logger.pop().unwrap());
 
         // Assert the output on the exit_file is the same
-        let status = running_frame.read_exit_file();
+        let status = running_frame.read_exit_file().await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_command_not_found() {
+    async fn test_run_command_not_found() {
         let running_frame =
             create_running_frame(r#"command_that_does_not_exist"#, 1, 1, HashMap::new());
 
         let logger = Arc::new(TestLogger::init());
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         assert!(status.is_ok());
         // The exact exit code might vary by system, but it should be non-zero
         assert_ne!((0, None), status.unwrap());
 
         // Assert the output on the exit_file is the same
-        let status = running_frame.read_exit_file();
+        let status = running_frame.read_exit_file().await;
         assert!(status.is_ok());
         assert_ne!((0, None), status.unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_sleep_command() {
+    async fn test_run_sleep_command() {
         use std::time::{Duration, Instant};
 
         let running_frame =
@@ -1603,7 +1614,8 @@ mod tests {
         let logger = Arc::new(TestLogger::init());
         let start = Instant::now();
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         let elapsed = start.elapsed();
 
         assert!(status.is_ok());
@@ -1615,14 +1627,14 @@ mod tests {
         assert_eq!("Done sleeping", logger.pop().unwrap());
 
         // Assert the output on the exit_file is the same
-        let status = running_frame.read_exit_file();
+        let status = running_frame.read_exit_file().await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn test_run_interleaved_stdout_stderr() {
+    async fn test_run_interleaved_stdout_stderr() {
         let running_frame = create_running_frame(
             r#"echo "stdout1" && echo "stderr1" >&2 && echo "stdout2" && echo "stderr2" >&2"#,
             1,
@@ -1632,7 +1644,8 @@ mod tests {
 
         let logger = Arc::new(TestLogger::init());
         let status = running_frame
-            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>);
+            .run_inner(Arc::clone(&logger) as Arc<dyn FrameLoggerT + Send + Sync + 'static>)
+            .await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
 
@@ -1643,7 +1656,7 @@ mod tests {
         assert!(logs.contains(&"stderr2".to_string()));
 
         // Assert the output on the exit_file is the same
-        let status = running_frame.read_exit_file();
+        let status = running_frame.read_exit_file().await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
     }
