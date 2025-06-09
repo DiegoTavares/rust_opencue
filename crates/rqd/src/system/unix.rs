@@ -561,7 +561,6 @@ impl UnixSystem {
             .sysinfo_system
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        sysinfo.refresh_processes(ProcessesToUpdate::All, true);
         self.procs_lineage_cache.clear();
         // Collect all session_ids
         let session_id_and_pid = sysinfo.processes().iter().filter_map(|(pid, proc)| {
@@ -688,7 +687,6 @@ impl UnixSystem {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mut children = Vec::new();
-        sysinfo.refresh_processes(ProcessesToUpdate::All, true);
 
         // Return none if the session owner has already finished or died
         if Self::is_proc_dead(sysinfo.process(Pid::from(*session_id as usize))) {
