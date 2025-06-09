@@ -1,5 +1,6 @@
 use std::os::fd::IntoRawFd;
 use std::os::unix::process::ExitStatusExt;
+use std::time::SystemTime;
 use std::{
     cmp,
     collections::HashMap,
@@ -11,9 +12,9 @@ use std::{
     process::ExitStatus,
     str::FromStr,
     sync::{Arc, RwLock},
-    time::{Duration, SystemTime},
 };
 use std::{process::Stdio, thread};
+use tokio::time::Duration;
 
 use bollard::{
     Docker,
@@ -1100,17 +1101,27 @@ impl RunningFrame {
         let mut stderr_lines = tokio::io::BufReader::new(stderr_file).lines();
 
         loop {
+            let mut current_iteration_has_data = false;
+
             tokio::select! {
                 stdout_result = stdout_lines.next_line() => {
                     match stdout_result {
-                        Ok(Some(line)) => logger.writeln(&line),
-                        _ => {}
+                        Ok(Some(line)) => {
+                            logger.writeln(&line);
+                            current_iteration_has_data = true;
+                        },
+                        Ok(None) => {}, // EOF reached
+                        Err(_) => {}, // Error reading
                     }
                 }
                 stderr_result = stderr_lines.next_line() => {
                     match stderr_result {
-                        Ok(Some(line)) => logger.writeln(&line),
-                        _ => {}
+                        Ok(Some(line)) => {
+                            logger.writeln(&line);
+                            current_iteration_has_data = true;
+                        },
+                        Ok(None) => {}, // EOF reached
+                        Err(_) => {}, // Error reading
                     }
                 }
                 _ = stop_flag.recv() => {
@@ -1118,6 +1129,14 @@ impl RunningFrame {
                     let _ = tokio::fs::remove_file(raw_stderr_path).await;
                     break;
                 }
+            }
+
+            // Add a delay to this loop taking into consideration if there's new data
+            // flowing throught the logs or not
+            if !current_iteration_has_data {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            } else if current_iteration_has_data {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
         Ok(())
