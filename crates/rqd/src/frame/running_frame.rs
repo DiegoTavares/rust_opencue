@@ -1091,11 +1091,11 @@ impl RunningFrame {
         let stdout_file = tokio::fs::File::open(&raw_stdout_path)
             .await
             .into_diagnostic()
-            .wrap_err("Failed to open raw stdout ({raw_stdout_path})")?;
+            .wrap_err(format!("Failed to open raw stdout ({raw_stdout_path})"))?;
         let stderr_file = tokio::fs::File::open(&raw_stderr_path)
             .await
             .into_diagnostic()
-            .wrap_err("Failed to open raw stderr ({raw_stderr_path})")?;
+            .wrap_err(format!("Failed to open raw stderr ({raw_stderr_path})"))?;
 
         let mut stdout_lines = tokio::io::BufReader::new(stdout_file).lines();
         let mut stderr_lines = tokio::io::BufReader::new(stderr_file).lines();
