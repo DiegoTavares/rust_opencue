@@ -415,7 +415,13 @@ impl UnixSystem {
         let load = Self::read_load_avg(&config.proc_loadavg_path)?;
         let (total_space, available_space) = self.read_temp_storage()?;
         let sysinfo = sysinfo::System::new_with_specifics(
-            RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+            RefreshKind::nothing()
+                .with_memory(MemoryRefreshKind::everything())
+                .with_processes(
+                    ProcessRefreshKind::nothing()
+                        .with_memory()
+                        .with_cmd(UpdateKind::Always),
+                ),
         );
 
         Ok(MachineDynamicInfo {
@@ -434,7 +440,13 @@ impl UnixSystem {
         let load = Self::read_load_avg(&config.proc_loadavg_path)?;
         let (total_space, available_space) = self.read_temp_storage()?;
         let sysinfo = sysinfo::System::new_with_specifics(
-            RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+            RefreshKind::nothing()
+                .with_memory(MemoryRefreshKind::everything())
+                .with_processes(
+                    ProcessRefreshKind::nothing()
+                        .with_memory()
+                        .with_cmd(UpdateKind::Always),
+                ),
         );
 
         Ok(MachineDynamicInfo {
@@ -557,7 +569,7 @@ impl UnixSystem {
     /// throught the refresh_procs method to gather the updated list
     /// of running processes
     fn refresh_procs_cache(&self) {
-        let mut sysinfo = self
+        let sysinfo = self
             .sysinfo_system
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -682,7 +694,7 @@ impl UnixSystem {
     /// Returns `None` if the process that created the session ID doesn't exist or cannot be
     /// accessed.
     fn calculate_proc_session_data(&self, session_id: &u32) -> Option<SessionData> {
-        let mut sysinfo = self
+        let sysinfo = self
             .sysinfo_system
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -965,14 +977,7 @@ impl SystemManager for UnixSystem {
             .sysinfo_system
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-
-        *sysinfo = sysinfo::System::new_with_specifics(
-            RefreshKind::nothing().with_processes(
-                ProcessRefreshKind::nothing()
-                    .with_memory()
-                    .with_cmd(UpdateKind::Always),
-            ),
-        );
+        sysinfo.refresh_processes(ProcessesToUpdate::All, true);
         drop(sysinfo);
         self.refresh_procs_cache();
     }
