@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use std::{process::Stdio, thread};
-use tokio::time::Duration;
+use tokio::time::{self, Duration};
 
 use bollard::{
     Docker,
@@ -1100,43 +1100,33 @@ impl RunningFrame {
         let mut stdout_lines = tokio::io::BufReader::new(stdout_file).lines();
         let mut stderr_lines = tokio::io::BufReader::new(stderr_file).lines();
 
+        let mut stdout_interval = time::interval(Duration::from_millis(300));
+        let mut stderr_interval = time::interval(Duration::from_millis(300));
         loop {
-            let mut current_iteration_has_data = false;
-
             tokio::select! {
-                stdout_result = stdout_lines.next_line() => {
-                    match stdout_result {
-                        Ok(Some(line)) => {
-                            logger.writeln(&line);
-                            current_iteration_has_data = true;
-                        },
-                        Ok(None) => {}, // EOF reached
-                        Err(_) => {}, // Error reading
+                _ = stdout_interval.tick() => {
+                    while let Ok(Some(line)) = stdout_lines.next_line().await {
+                        logger.writeln(&line);
                     }
                 }
-                stderr_result = stderr_lines.next_line() => {
-                    match stderr_result {
-                        Ok(Some(line)) => {
-                            logger.writeln(&line);
-                            current_iteration_has_data = true;
-                        },
-                        Ok(None) => {}, // EOF reached
-                        Err(_) => {}, // Error reading
+                _ = stderr_interval.tick() => {
+                    while let Ok(Some(line)) = stderr_lines.next_line().await {
+                        logger.writeln(&line);
                     }
                 }
                 _ = stop_flag.recv() => {
+                    // Drain both buffers before exiting
+                    while let Ok(Some(line)) = stdout_lines.next_line().await {
+                        logger.writeln(&line);
+                    }
+                    while let Ok(Some(line)) = stderr_lines.next_line().await {
+                        logger.writeln(&line);
+                    }
+                    // Remove temporary files
                     let _ = tokio::fs::remove_file(raw_stdout_path).await;
                     let _ = tokio::fs::remove_file(raw_stderr_path).await;
                     break;
                 }
-            }
-
-            // Add a delay to this loop taking into consideration if there's new data
-            // flowing throught the logs or not
-            if !current_iteration_has_data {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            } else if current_iteration_has_data {
-                tokio::time::sleep(Duration::from_millis(300)).await;
             }
         }
         Ok(())
