@@ -1100,7 +1100,7 @@ impl RunningFrame {
         let mut stderr_lines = tokio::io::BufReader::new(stderr_file).lines();
 
         let mut stdout_interval = time::interval(Duration::from_millis(300));
-        let mut stderr_interval = time::interval(Duration::from_millis(300));
+        let mut stderr_interval = time::interval(Duration::from_millis(500));
         loop {
             tokio::select! {
                 _ = stdout_interval.tick() => {
