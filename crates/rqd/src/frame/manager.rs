@@ -156,6 +156,7 @@ impl FrameManager {
         let mut errors = Vec::new();
         for path in snapshot_dir {
             let running_frame = RunningFrame::from_snapshot(&path, self.config.runner.clone())
+                .await
                 .map(|rf| Arc::new(rf));
             match running_frame {
                 Ok(running_frame) => {

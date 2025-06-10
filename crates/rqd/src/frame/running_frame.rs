@@ -6,7 +6,6 @@ use std::{
     collections::HashMap,
     env,
     fmt::Display,
-    io::BufReader,
     os::fd::{FromRawFd, RawFd},
     path::Path,
     process::ExitStatus,
@@ -1196,12 +1195,13 @@ impl RunningFrame {
     /// TODO: Consider discarding old snapshots, or add additional checks to ensures
     /// the snapshot is binding to the correct process
     ///
-    pub fn from_snapshot(path: &str, config: RunnerConfig) -> Result<Self> {
-        let file = std::fs::File::open(path)
+    pub async fn from_snapshot(path: &str, config: RunnerConfig) -> Result<Self> {
+        let file = tokio::fs::File::open(path)
+            .await
             .map_err(|err| miette!("Failed to open snapshot file. {}", err))?;
-        let reader = BufReader::new(file);
+        let reader = tokio::io::BufReader::new(file);
 
-        let mut frame: RunningFrame = bincode::deserialize_from(reader)
+        let mut frame: RunningFrame = bincode::deserialize_from(reader.buffer())
             .into_diagnostic()
             .map_err(|e| miette!("Failed to deserialize frame snapshot: {}", e))?;
 
