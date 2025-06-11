@@ -556,50 +556,60 @@ impl UnixSystem {
 
         self.session_processes.clear();
 
-        // 1. pid (%d) - The process ID
-        // 2. comm (%s) - The filename of the executable in parentheses (truncated to 16 chars including null terminator)
-        // 3. state (%c) - Process state: R (Running), S (Sleeping), D (Uninterruptible sleep), Z (Zombie), T (Stopped), t (Tracing stop), X/x (Dead), K (Wakekill), W (Waking), P (Parked), I (Idle)
-        // 4. ppid (%d) - Parent process ID
-        // 5. pgrp (%d) - Process group ID
-        // 6. session (%d) - Session ID
-        // 7. tty_nr (%d) - Controlling terminal (minor device in bits 31-20 & 7-0, major in bits 15-8)
-        // 8. tpgid (%d) - Foreground process group ID of controlling terminal
         for entry in proc_dir.flatten() {
             let pid = match entry.file_name().to_string_lossy().parse::<u32>() {
                 Ok(pid) => pid,
                 Err(_) => continue, // Skip non-pid paths
             };
 
-            let stat_path = format!("/proc/{}/stat", pid);
+            let stat_path = format!("/proc/{}/status", pid);
             let stat = std::fs::read_to_string(stat_path).into_diagnostic()?;
-            let fields: Vec<&str> = stat.split_whitespace().collect();
-            if fields.len() >= 6 {
-                // Unpack values
-                let (session_id, pgrp, state) = match (
-                    fields[6].parse::<u32>(),
-                    fields[5].parse::<u32>(),
-                    fields.get(2),
-                ) {
-                    (Ok(sid), Ok(pgrp), Some(state)) => (sid, pgrp, *state),
-                    _ => continue,
-                };
-                // Only store valid states
-                let valid_state = match state {
-                    "R" | "S" | "D" | "T" => true, // Running, Sleeping, Disk Sleep, Stopped
-                    "Z" | "X" => false,            // Zombie, Dead
-                    _ => true,                     // Monitor unkwnown states
-                };
-
-                let is_group_leader = pid == pgrp;
-
-                if self.monitored_sessions.contains(&session_id) && is_group_leader && valid_state {
-                    self.session_processes
-                        .entry(session_id)
-                        .or_default()
-                        .push(pid);
+            let mut session_id: Option<u32> = None;
+            let mut tgid: Option<u32> = None;
+            let mut state = None;
+            for line in stat.lines() {
+                match line.split_once(":") {
+                    Some((key, value)) => match key {
+                        "Tgid" => {
+                            tgid = value.trim().parse().ok();
+                        }
+                        "NSsid" => {
+                            session_id = value.trim().parse().ok();
+                        }
+                        "SID" => {
+                            session_id = value.trim().parse().ok();
+                        }
+                        "State" => {
+                            state = value.trim().split_whitespace().next();
+                        }
+                        _ => (),
+                    },
+                    None => (),
                 }
-            } else {
-                continue;
+            }
+            match (session_id, tgid, state) {
+                (Some(session_id), Some(tgid), Some(state)) => {
+                    // Only store valid states
+                    let valid_state = match state {
+                        "R" | "S" | "D" | "T" => true, // Running, Sleeping, Disk Sleep, Stopped
+                        "Z" | "X" => false,            // Zombie, Dead
+                        _ => true,                     // Monitor unkwnown states
+                    };
+
+                    let is_group_leader = pid == tgid;
+
+                    if session_id != 0
+                        && self.monitored_sessions.contains(&session_id)
+                        && is_group_leader
+                        && valid_state
+                    {
+                        self.session_processes
+                            .entry(session_id)
+                            .or_default()
+                            .push(pid);
+                    }
+                }
+                _ => todo!(),
             }
         }
         Ok(())
