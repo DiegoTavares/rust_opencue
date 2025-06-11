@@ -135,7 +135,6 @@ impl MachineMonitor {
                     }
                 }
                 _ = interval.tick() => {
-                    self.update_procs().await;
                     self.collect_and_send_host_report().await?;
                     self.check_reboot_flag().await;
                 }
@@ -154,11 +153,6 @@ impl MachineMonitor {
             }
             None => warn!("Interrupt channel has already been used"),
         }
-    }
-
-    async fn update_procs(&self) {
-        let system_manager = self.system_manager.lock().await;
-        system_manager.refresh_procs();
     }
 
     async fn collect_and_send_host_report(&self) -> Result<()> {
@@ -652,6 +646,10 @@ impl Machine for MachineMonitor {
 
     async fn collect_host_report(&self) -> Result<HostReport> {
         let system_manager = self.system_manager.lock().await;
+        // If there are frames running update the list of procs on the machine
+        if !self.running_frames_cache.is_empty() {
+            system_manager.refresh_procs();
+        }
         let render_host = Self::inspect_host_state(&self.maching_config, &system_manager)?;
         drop(system_manager);
         // Store the last host_state on self

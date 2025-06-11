@@ -20,7 +20,7 @@ use opencue_proto::{
 };
 use sysinfo::{
     DiskRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessStatus,
-    ProcessesToUpdate, RefreshKind, UpdateKind,
+    ProcessesToUpdate, RefreshKind,
 };
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -409,50 +409,34 @@ impl UnixSystem {
         Ok(override_workstation_mode)
     }
 
-    #[cfg(target_os = "linux")]
-    fn read_dynamic_stat(&self) -> Result<MachineDynamicInfo> {
-        let config = &self.config;
-        let load = Self::read_load_avg(&config.proc_loadavg_path)?;
-        let (total_space, available_space) = self.read_temp_storage()?;
-        let sysinfo = sysinfo::System::new_with_specifics(
-            RefreshKind::nothing()
-                .with_memory(MemoryRefreshKind::everything())
-                .with_processes(
-                    ProcessRefreshKind::nothing()
-                        .with_memory()
-                        .with_cmd(UpdateKind::Always),
-                ),
-        );
-
-        Ok(MachineDynamicInfo {
-            // TODO: Confirm available_memory is the best option for linux
-            available_memory: sysinfo.available_memory(),
-            free_swap: sysinfo.free_swap(),
-            total_temp_storage: total_space,
-            free_temp_storage: available_space,
-            load: ((load.0 * 100.0).round() as u32 / self.static_info.hyperthreading_multiplier),
-        })
+    #[cfg(target_os = "macos")]
+    fn calc_available_memory(total_memory: u64, used_memory: u64, _available_memory: u64) -> u64 {
+        // sysinfo.available_memory() would be the best way to infer available memory, but it
+        // returns 0 on M macs
+        total_memory - used_memory
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "linux")]
+    fn calc_available_memory(_total_memory: u64, _used_memory: u64, available_memory: u64) -> u64 {
+        available_memory
+    }
+
     fn read_dynamic_stat(&self) -> Result<MachineDynamicInfo> {
         let config = &self.config;
         let load = Self::read_load_avg(&config.proc_loadavg_path)?;
         let (total_space, available_space) = self.read_temp_storage()?;
-        let sysinfo = sysinfo::System::new_with_specifics(
-            RefreshKind::nothing()
-                .with_memory(MemoryRefreshKind::everything())
-                .with_processes(
-                    ProcessRefreshKind::nothing()
-                        .with_memory()
-                        .with_cmd(UpdateKind::Always),
-                ),
-        );
+        let mut sysinfo = self
+            .sysinfo_system
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        sysinfo.refresh_memory();
 
         Ok(MachineDynamicInfo {
-            // sysinfo.available_memory() would be the best way to infer available memory, but it
-            // returns 0 on M macs
-            available_memory: sysinfo.total_memory() - sysinfo.used_memory(),
+            available_memory: Self::calc_available_memory(
+                sysinfo.total_memory(),
+                sysinfo.used_memory(),
+                sysinfo.available_memory(),
+            ),
             free_swap: sysinfo.free_swap(),
             total_temp_storage: total_space,
             free_temp_storage: available_space,
@@ -569,10 +553,15 @@ impl UnixSystem {
     /// throught the refresh_procs method to gather the updated list
     /// of running processes
     fn refresh_procs_cache(&self) {
-        let sysinfo = self
+        let mut sysinfo = self
             .sysinfo_system
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        sysinfo.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
         self.procs_lineage_cache.clear();
         // Collect all session_ids
         let session_id_and_pid = sysinfo.processes().iter().filter_map(|(pid, proc)| {
@@ -636,6 +625,7 @@ impl UnixSystem {
     /// # Returns
     /// * `Result<bool>` - Ok(true) if the process is a thread group leader, Ok(false) if not,
     ///   or an error if the process information couldn't be read
+    #[cfg(target_os = "linux")]
     fn is_thread_group_leader(pid: &u32) -> Result<bool> {
         let stat_path = format!("/proc/{}/status", pid);
 
@@ -671,6 +661,12 @@ impl UnixSystem {
         })
     }
 
+    #[cfg(target_os = "macos")]
+    fn is_thread_group_leader(_pid: &u32) -> Result<bool> {
+        // TODO: Implement a logic for macos that don't rely on /proc files to get a thread group leader
+        Ok(true)
+    }
+
     /// Calculates memory usage of all processes associated with a session ID.
     ///
     /// This method aggregates memory statistics for a process and all of its children
@@ -694,23 +690,42 @@ impl UnixSystem {
     /// Returns `None` if the process that created the session ID doesn't exist or cannot be
     /// accessed.
     fn calculate_proc_session_data(&self, session_id: &u32) -> Option<SessionData> {
-        let sysinfo = self
+        let mut sysinfo = self
             .sysinfo_system
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mut children = Vec::new();
 
+        // Refresh session parent
+        let session_pid = Pid::from_u32(*session_id);
+        sysinfo.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&vec![session_pid]),
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
+
         // Return none if the session owner has already finished or died
-        if Self::is_proc_dead(sysinfo.process(Pid::from(*session_id as usize))) {
+        if Self::is_proc_dead(sysinfo.process(session_pid)) {
             return None;
         }
         // If session owner is still alive, iterate over the session and calculate memory
-        let (memory, virtual_memory, gpu_memory, start_time, run_time) =
-            match self.procs_lineage_cache.get(session_id) {
-                Some(ref lineage) => lineage
+        let (memory, virtual_memory, gpu_memory, start_time, run_time) = match self
+            .procs_lineage_cache
+            .get(session_id)
+        {
+            Some(ref lineage) => {
+                // Process session data
+                lineage
                     .iter()
-                    .filter_map(
-                        |pid| match sysinfo.process(Pid::from(pid.clone() as usize)) {
+                    .filter_map(|pid| {
+                        // Refresh only the procs we need info about
+                        sysinfo.refresh_processes_specifics(
+                            ProcessesToUpdate::Some(&vec![Pid::from_u32(*pid)]),
+                            true,
+                            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+                        );
+
+                        match sysinfo.process(Pid::from(pid.clone() as usize)) {
                             Some(proc)
                                 if !Self::is_proc_dead(Some(proc))
                                     && Self::is_thread_group_leader(pid).unwrap_or(false) =>
@@ -748,9 +763,10 @@ impl UnixSystem {
                                     proc.run_time(),
                                 ))
                             }
+                            None => None,
                             _ => None,
-                        },
-                    )
+                        }
+                    })
                     .reduce(|a, b| {
                         (
                             a.0 + b.0,
@@ -760,9 +776,10 @@ impl UnixSystem {
                             std::cmp::max(a.4, b.4),
                         )
                     })
-                    .unwrap_or((0, 0, 0, u64::MAX, 0)),
-                None => (0, 0, 0, u64::MAX, 0),
-            };
+                    .unwrap_or((0, 0, 0, u64::MAX, 0))
+            }
+            None => (0, 0, 0, u64::MAX, 0),
+        };
         Some(SessionData {
             memory,
             virtual_memory,
@@ -973,12 +990,6 @@ impl SystemManager for UnixSystem {
     }
 
     fn refresh_procs(&self) {
-        let mut sysinfo = self
-            .sysinfo_system
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        sysinfo.refresh_processes(ProcessesToUpdate::All, true);
-        drop(sysinfo);
         self.refresh_procs_cache();
     }
 
