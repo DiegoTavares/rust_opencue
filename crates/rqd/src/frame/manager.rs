@@ -12,11 +12,10 @@ use uuid::Uuid;
 
 use crate::{config::config::Config, servant::rqd_servant::MachineImpl};
 
-use super::{cache::RunningFrameCache, running_frame::RunningFrame};
+use super::running_frame::RunningFrame;
 
 pub struct FrameManager {
     pub config: Config,
-    pub frame_cache: Arc<RunningFrameCache>,
     pub machine: Arc<MachineImpl>,
 }
 
@@ -202,8 +201,7 @@ impl FrameManager {
     }
 
     fn spawn_running_frame(&self, running_frame: Arc<RunningFrame>, recover_mode: bool) {
-        self.frame_cache
-            .insert_running_frame(Arc::clone(&running_frame));
+        self.machine.add_running_frame(Arc::clone(&running_frame));
         let running_frame_ref: Arc<RunningFrame> = Arc::clone(&running_frame);
         let thread_handle = tokio::spawn(async move { running_frame.run(recover_mode).await });
         if let Err(err) = running_frame_ref.update_launch_thread_handle(thread_handle) {
@@ -215,15 +213,14 @@ impl FrameManager {
     }
 
     fn spawn_docker_frame(&self, running_frame: Arc<RunningFrame>, recovery_mode: bool) {
-        self.frame_cache
-            .insert_running_frame(Arc::clone(&running_frame));
+        self.machine.add_running_frame(Arc::clone(&running_frame));
         let _thread_handle =
             tokio::spawn(async move { running_frame.run_docker(recovery_mode).await });
     }
 
     fn validate_grpc_frame(&self, run_frame: &RunFrame) -> Result<(), FrameManagerError> {
         // Frame is already running
-        if self.frame_cache.contains(&run_frame.frame_id()) {
+        if self.machine.is_frame_running(&run_frame.frame_id()) {
             Err(FrameManagerError::AlreadyExist(format!(
                 "Not lauching, frame is already running on this host {}",
                 run_frame.frame_id()
@@ -282,10 +279,7 @@ impl FrameManager {
     }
 
     pub fn get_running_frame(&self, frame_id: &Uuid) -> Option<Arc<RunningFrame>> {
-        self.frame_cache
-            .get(frame_id)
-            .as_ref()
-            .map(|f| Arc::clone(f))
+        self.machine.get_running_frame(frame_id)
     }
 
     /// Kills a running frame on this host.

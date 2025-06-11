@@ -10,7 +10,7 @@ use std::{
 };
 
 use chrono::{DateTime, Local};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use itertools::Itertools;
 use miette::{Context, IntoDiagnostic, Result, miette};
 use nix::sys::signal::{Signal, kill, killpg};
@@ -54,7 +54,8 @@ pub struct UnixSystem {
     attributes: HashMap<String, String>,
     sysinfo_system: Mutex<sysinfo::System>,
     // Cache of monitored processes and their lineage
-    procs_lineage_cache: DashMap<u32, Vec<u32>>,
+    session_processes: DashMap<u32, Vec<u32>>,
+    monitored_sessions: DashSet<u32>,
 }
 
 #[derive(Debug)]
@@ -159,7 +160,8 @@ impl UnixSystem {
                 reserved_cores_by_physid: HashMap::new(),
             },
             sysinfo_system: Mutex::new(sysinfo::System::new()),
-            procs_lineage_cache: DashMap::new(),
+            session_processes: DashMap::new(),
+            monitored_sessions: DashSet::new(),
         })
     }
 
@@ -547,12 +549,68 @@ impl UnixSystem {
         Ok(available_cores.collect())
     }
 
+    fn refresh_procs_cache(&self) -> Result<()> {
+        let proc_dir = std::fs::read_dir("/proc")
+            .into_diagnostic()
+            .wrap_err("Failed to read /proc")?;
+
+        self.session_processes.clear();
+
+        // 1. pid (%d) - The process ID
+        // 2. comm (%s) - The filename of the executable in parentheses (truncated to 16 chars including null terminator)
+        // 3. state (%c) - Process state: R (Running), S (Sleeping), D (Uninterruptible sleep), Z (Zombie), T (Stopped), t (Tracing stop), X/x (Dead), K (Wakekill), W (Waking), P (Parked), I (Idle)
+        // 4. ppid (%d) - Parent process ID
+        // 5. pgrp (%d) - Process group ID
+        // 6. session (%d) - Session ID
+        // 7. tty_nr (%d) - Controlling terminal (minor device in bits 31-20 & 7-0, major in bits 15-8)
+        // 8. tpgid (%d) - Foreground process group ID of controlling terminal
+        for entry in proc_dir.flatten() {
+            let pid = match entry.file_name().to_string_lossy().parse::<u32>() {
+                Ok(pid) => pid,
+                Err(_) => continue, // Skip non-pid paths
+            };
+
+            let stat_path = format!("/proc/{}/stat", pid);
+            let stat = std::fs::read_to_string(stat_path).into_diagnostic()?;
+            let fields: Vec<&str> = stat.split_whitespace().collect();
+            if fields.len() >= 6 {
+                // Unpack values
+                let (session_id, pgrp, state) = match (
+                    fields[6].parse::<u32>(),
+                    fields[5].parse::<u32>(),
+                    fields.get(2),
+                ) {
+                    (Ok(sid), Ok(pgrp), Some(state)) => (sid, pgrp, *state),
+                    _ => continue,
+                };
+                // Only store valid states
+                let valid_state = match state {
+                    "R" | "S" | "D" | "T" => true, // Running, Sleeping, Disk Sleep, Stopped
+                    "Z" | "X" => false,            // Zombie, Dead
+                    _ => true,                     // Monitor unkwnown states
+                };
+
+                let is_group_leader = pid == pgrp;
+
+                if self.monitored_sessions.contains(&session_id) && is_group_leader && valid_state {
+                    self.session_processes
+                        .entry(session_id)
+                        .or_default()
+                        .push(pid);
+                }
+            } else {
+                continue;
+            }
+        }
+        Ok(())
+    }
+
     /// Refresh the cache of children procs.
     ///
     /// This method relies on sysinfo to have been updated periodically
     /// throught the refresh_procs method to gather the updated list
     /// of running processes
-    fn refresh_procs_cache(&self) {
+    fn refresh_procs_cache_less_efficient(&self) {
         let mut sysinfo = self
             .sysinfo_system
             .lock()
@@ -562,7 +620,7 @@ impl UnixSystem {
             true,
             ProcessRefreshKind::nothing(),
         );
-        self.procs_lineage_cache.clear();
+        self.session_processes.clear();
         // Collect all session_ids
         let session_id_and_pid = sysinfo.processes().iter().filter_map(|(pid, proc)| {
             let session_pid = proc.session_id().unwrap_or(Pid::from_u32(0)).as_u32();
@@ -583,7 +641,7 @@ impl UnixSystem {
         });
         // Group all processes by session_id
         for (session_pid, pid) in session_id_and_pid {
-            self.procs_lineage_cache
+            self.session_processes
                 .entry(session_pid)
                 .and_modify(|procs| {
                     procs.push(pid);
@@ -612,61 +670,6 @@ impl UnixSystem {
         }
     }
 
-    /// Check if a pid belongs to a process that is the owner of its thread group
-    ///
-    /// Although this module tries to avoid messing with /proc files directly to prevent
-    /// compatibility issues with different kernel versions in favor of using the sysinfo
-    /// crate, it doesn't provide a way to capture a process tgid. Without a process tgid
-    /// it is impossible to set apart leader processes and their tasks.
-    ///
-    /// # Arguments
-    /// * `pid` - The process ID to check
-    ///
-    /// # Returns
-    /// * `Result<bool>` - Ok(true) if the process is a thread group leader, Ok(false) if not,
-    ///   or an error if the process information couldn't be read
-    #[cfg(target_os = "linux")]
-    fn is_thread_group_leader(pid: &u32) -> Result<bool> {
-        let stat_path = format!("/proc/{}/status", pid);
-
-        let status_f = File::open(stat_path).into_diagnostic()?;
-        let reader = BufReader::new(status_f);
-        // let mut load_val: Vec<u32> = vec![];
-        let mut pid: Option<u32> = None;
-        let mut tgid: Option<u32> = None;
-        for line_res in reader.lines().into_iter() {
-            match line_res {
-                Ok(line) => {
-                    if line.starts_with("Pid") {
-                        pid = line
-                            .split(":")
-                            .last()
-                            .map(|val| val.trim().parse().ok())
-                            .flatten()
-                    } else if line.starts_with("Tgid") {
-                        tgid = line
-                            .split(":")
-                            .last()
-                            .map(|val| val.trim().parse().ok())
-                            .flatten()
-                    }
-                }
-                _ => (),
-            };
-        }
-
-        Ok(match (pid, tgid) {
-            (Some(pid), Some(tgid)) => pid == tgid,
-            _ => false,
-        })
-    }
-
-    #[cfg(target_os = "macos")]
-    fn is_thread_group_leader(_pid: &u32) -> Result<bool> {
-        // TODO: Implement a logic for macos that don't rely on /proc files to get a thread group leader
-        Ok(true)
-    }
-
     /// Calculates memory usage of all processes associated with a session ID.
     ///
     /// This method aggregates memory statistics for a process and all of its children
@@ -690,6 +693,8 @@ impl UnixSystem {
     /// Returns `None` if the process that created the session ID doesn't exist or cannot be
     /// accessed.
     fn calculate_proc_session_data(&self, session_id: &u32) -> Option<SessionData> {
+        self.monitored_sessions.insert(*session_id);
+
         let mut sysinfo = self
             .sysinfo_system
             .lock()
@@ -710,7 +715,7 @@ impl UnixSystem {
         }
         // If session owner is still alive, iterate over the session and calculate memory
         let (memory, virtual_memory, gpu_memory, start_time, run_time) = match self
-            .procs_lineage_cache
+            .session_processes
             .get(session_id)
         {
             Some(ref lineage) => {
@@ -726,10 +731,7 @@ impl UnixSystem {
                         );
 
                         match sysinfo.process(Pid::from(pid.clone() as usize)) {
-                            Some(proc)
-                                if !Self::is_proc_dead(Some(proc))
-                                    && Self::is_thread_group_leader(pid).unwrap_or(false) =>
-                            {
+                            Some(proc) if !Self::is_proc_dead(Some(proc)) => {
                                 // Confirm this is a proc and not a thread
                                 let start_time_str = DateTime::<Local>::from(
                                     UNIX_EPOCH + Duration::from_secs(proc.start_time()),
@@ -990,7 +992,10 @@ impl SystemManager for UnixSystem {
     }
 
     fn refresh_procs(&self) {
-        self.refresh_procs_cache();
+        if let Err(err) = self.refresh_procs_cache() {
+            debug!("{err}. Falling back to less efficient alternative");
+            self.refresh_procs_cache_less_efficient();
+        };
     }
 
     fn kill_session(&self, session_pid: u32) -> Result<()> {
@@ -1025,7 +1030,7 @@ impl SystemManager for UnixSystem {
     }
 
     fn get_proc_lineage(&self, pid: u32) -> Option<Vec<u32>> {
-        self.procs_lineage_cache
+        self.session_processes
             .get(&pid)
             .map(|lineage| lineage.clone())
     }
@@ -1054,7 +1059,7 @@ mod tests {
     use std::fs;
     use std::{collections::HashMap, sync::Mutex};
 
-    use dashmap::DashMap;
+    use dashmap::{DashMap, DashSet};
     use itertools::Itertools;
     use opencue_proto::host::HardwareState;
     use uuid::Uuid;
@@ -1802,7 +1807,8 @@ mod tests {
             hardware_state: HardwareState::Up,
             attributes: HashMap::new(),
             sysinfo_system: Mutex::new(sysinfo::System::new()),
-            procs_lineage_cache: DashMap::new(),
+            session_processes: DashMap::new(),
+            monitored_sessions: DashSet::new(),
         }
     }
 }
