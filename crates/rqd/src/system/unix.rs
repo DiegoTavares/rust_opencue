@@ -9,6 +9,8 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
+use libc::{_SC_CLK_TCK, _SC_PAGESIZE};
+
 use chrono::{DateTime, Local};
 use dashmap::{DashMap, DashSet};
 use itertools::Itertools;
@@ -56,6 +58,24 @@ pub struct UnixSystem {
     // Cache of monitored processes and their lineage
     session_processes: DashMap<u32, Vec<u32>>,
     monitored_sessions: DashSet<u32>,
+    cached_processes: DashMap<u32, ProcessData>,
+}
+
+#[derive(Debug)]
+struct ProcessData {
+    memory: u64,
+    virtual_memory: u64,
+    cmd: String,
+    state: String,
+    name: String,
+    start_time: u64,
+    run_time: u64,
+}
+
+impl ProcessData {
+    pub fn is_dead(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -74,7 +94,7 @@ struct MachineStaticInfo {
     pub cores_per_socket: u32,
     // Unlike the python counterpart, the multiplier is not automatically applied to total_procs
     pub hyperthreading_multiplier: u32,
-    pub boot_time: u32,
+    pub boot_time: u64,
     pub tags: Vec<String>,
 }
 
@@ -162,6 +182,7 @@ impl UnixSystem {
             sysinfo_system: Mutex::new(sysinfo::System::new()),
             session_processes: DashMap::new(),
             monitored_sessions: DashSet::new(),
+            cached_processes: DashMap::new(),
         })
     }
 
@@ -355,10 +376,10 @@ impl UnixSystem {
     /// # Returns
     ///
     /// A `Result` containing a `u32` representing the time when the system was last booted.
-    fn read_boot_time(proc_stat_path: &str) -> Result<u32> {
+    fn read_boot_time(proc_stat_path: &str) -> Result<u64> {
         let stat_info = File::open(proc_stat_path).into_diagnostic()?;
         let reader = BufReader::new(stat_info);
-        let mut btime: Option<u32> = None;
+        let mut btime: Option<u64> = None;
         for line_res in reader.lines().into_iter() {
             if let Ok(line) = line_res {
                 if line.trim().starts_with("btime") {
@@ -564,9 +585,12 @@ impl UnixSystem {
 
             let stat_path = format!("/proc/{}/status", pid);
             let stat = std::fs::read_to_string(stat_path).into_diagnostic()?;
+
+            // Fields
             let mut session_id: Option<u32> = None;
             let mut tgid: Option<u32> = None;
             let mut state = None;
+
             for line in stat.lines() {
                 match line.split_once(":") {
                     Some((key, value)) => match key {
@@ -603,6 +627,9 @@ impl UnixSystem {
                         && is_group_leader
                         && valid_state
                     {
+                        if let Ok(process_data) = self.read_proc_stat(pid) {
+                            self.cached_processes.insert(pid, process_data);
+                        }
                         self.session_processes
                             .entry(session_id)
                             .or_default()
@@ -613,6 +640,132 @@ impl UnixSystem {
             }
         }
         Ok(())
+    }
+
+    /// stat fields:
+    /// Basic Process Information
+    // 1. **pid** (%d) - The process ID
+    // 2. **comm** (%s) - The filename of the executable in parentheses (truncated to 16 chars including null terminator)
+    // 3. **state** (%c) - Process state: R (Running), S (Sleeping), D (Uninterruptible sleep), Z (Zombie), T (Stopped), t (Tracing stop), X/x (Dead), K (Wakekill), W (Waking), P (Parked), I (Idle)
+    // 4. **ppid** (%d) - Parent process ID
+    // 5. **pgrp** (%d) - Process group ID
+    // 6. **session** (%d) - Session ID
+    // 7. **tty_nr** (%d) - Controlling terminal (minor device in bits 31-20 & 7-0, major in bits 15-8)
+    // 8. **tpgid** (%d) - Foreground process group ID of controlling terminal
+
+    // ### Process Flags and Fault Counters
+    // 9. **flags** (%u) - Kernel flags word (see PF_* defines in kernel source)
+    // 10. **minflt** (%lu) - Minor page faults (no disk I/O required)
+    // 11. **cminflt** (%lu) - Minor faults of waited-for children
+    // 12. **majflt** (%lu) - Major page faults (disk I/O required)
+    // 13. **cmajflt** (%lu) - Major faults of waited-for children
+
+    // ### CPU Time Information
+    // 14. **utime** (%lu) - User mode CPU time in clock ticks (includes guest time)
+    // 15. **stime** (%lu) - Kernel mode CPU time in clock ticks
+    // 16. **cutime** (%ld) - Children's user mode CPU time in clock ticks
+    // 17. **cstime** (%ld) - Children's kernel mode CPU time in clock ticks
+
+    // ### Scheduling Information
+    // 18. **priority** (%ld) - Scheduling priority (-2 to -100 for RT, 0-39 for normal processes)
+    // 19. **nice** (%ld) - Nice value (-20 to 19)
+    // 20. **num_threads** (%ld) - Number of threads in the process
+    // 21. **itrealvalue** (%ld) - Time until next SIGALRM (obsolete, always 0 since 2.6.17)
+
+    // ### Memory and Runtime Information
+    // 22. **starttime** (%llu) - Process start time after system boot in clock ticks
+    // 23. **vsize** (%lu) - Virtual memory size in bytes
+    // 24. **rss** (%ld) - Resident Set Size in pages (inaccurate, use /proc/pid/statm instead)
+    // 25. **rsslim** (%lu) - Current RSS soft limit in bytes
+
+    // ### Memory Layout (Protected by ptrace permissions [PT])
+    // 26. **startcode** (%lu) [PT] - Address above which program text can run
+    // 27. **endcode** (%lu) [PT] - Address below which program text can run
+    // 28. **startstack** (%lu) [PT] - Stack start address (bottom of stack)
+    // 29. **kstkesp** (%lu) [PT] - Current stack pointer (ESP) value
+    // 30. **kstkeip** (%lu) [PT] - Current instruction pointer (EIP) value
+
+    // ### Signal Information (Obsolete)
+    // 31. **signal** (%lu) - Bitmap of pending signals (obsolete, use /proc/pid/status)
+    // 32. **blocked** (%lu) - Bitmap of blocked signals (obsolete)
+    // 33. **sigignore** (%lu) - Bitmap of ignored signals (obsolete)
+    // 34. **sigcatch** (%lu) - Bitmap of caught signals (obsolete)
+
+    // ### Wait Channel and Swap Information
+    // 35. **wchan** (%lu) [PT] - Wait channel address where process is sleeping
+    // 36. **nswap** (%lu) - Number of pages swapped (not maintained)
+    // 37. **cnswap** (%lu) - Cumulative nswap for children (not maintained)
+
+    // ### Process Termination and CPU Assignment
+    // 38. **exit_signal** (%d) - Signal to send to parent when process dies
+    // 39. **processor** (%d) - CPU number last executed on
+
+    // ### Real-time Scheduling
+    // 40. **rt_priority** (%u) - Real-time priority (1-99 for RT processes, 0 for normal)
+    // 41. **policy** (%u) - Scheduling policy (use SCHED_* constants)
+
+    // ### I/O and Guest Time
+    // 42. **delayacct_blkio_ticks** (%llu) - Aggregated block I/O delays in clock ticks
+    // 43. **guest_time** (%lu) - Time spent running virtual CPU for guest OS
+    // 44. **cguest_time** (%ld) - Children's guest time
+
+    // ### Extended Memory Layout (Protected [PT])
+    // 45. **start_data** (%lu) [PT] - Address above which initialized/uninitialized data is placed
+    // 46. **end_data** (%lu) [PT] - Address below which initialized/uninitialized data is placed
+    // 47. **start_brk** (%lu) [PT] - Address above which heap can be expanded with brk()
+    // 48. **arg_start** (%lu) [PT] - Address above which command-line arguments are placed
+    // 49. **arg_end** (%lu) [PT] - Address below which command-line arguments are placed
+    // 50. **env_start** (%lu) [PT] - Address above which environment variables are placed
+    // 51. **env_end** (%lu) [PT] - Address below which environment variables are placed
+    // 52. **exit_code** (%d) [PT] - Thread's exit status as reported by waitpid()
+    fn read_proc_stat(&self, pid: u32) -> Result<ProcessData> {
+        let stat_path = format!("/proc/{}/stat", pid);
+        let stat = std::fs::read_to_string(stat_path).into_diagnostic()?;
+        let fields: Vec<&str> = stat.split_whitespace().collect();
+        if fields.len() >= 20 {
+            // Unpack values
+            let (memory, virtual_memory, state, name, start_time) = match (
+                fields[23].parse::<u64>(), // rss
+                fields[22].parse::<u64>(), // vsize
+                fields.get(2),             // state
+                fields.get(1),             // name
+                fields[21].parse::<u64>(), // starttime
+            ) {
+                (Ok(memory), Ok(virtual_memory), Some(state), Some(name), Ok(start_time)) => (
+                    memory.saturating_mul(_SC_PAGESIZE as u64),
+                    virtual_memory,
+                    state.to_string(),
+                    name.to_string(),
+                    start_time,
+                ),
+                _ => Err(miette!("Invalid /proc/stat file for {pid}"))?,
+            };
+            let (start_time, run_time) = self.calculate_process_time(start_time);
+            let cmd = "".to_string();
+            Ok(ProcessData {
+                memory,
+                virtual_memory,
+                cmd,
+                state,
+                name,
+                start_time,
+                run_time,
+            })
+        } else {
+            Err(miette!("Invalid /proc/stat file for {pid}"))
+        }
+    }
+
+    fn calculate_process_time(&self, process_start_time: u64) -> (u64, u64) {
+        let start_time_witout_boot_time: u64 = process_start_time / _SC_CLK_TCK as u64;
+
+        let start_time = self.static_info.boot_time + start_time_witout_boot_time;
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+            .as_secs();
+        let run_time = now_epoch - start_time;
+        (start_time, run_time)
     }
 
     /// Refresh the cache of children procs.
@@ -680,6 +833,81 @@ impl UnixSystem {
         }
     }
 
+    fn calculate_proc_session_data(&self, session_id: &u32) -> Option<SessionData> {
+        let mut children = Vec::new();
+        self.monitored_sessions.insert(*session_id);
+
+        let _session_leader = self
+            .cached_processes
+            .get(session_id)
+            .and_then(|proc| match proc.is_dead() {
+                true => None,
+                false => Some(proc),
+            })?;
+
+        // If session owner is still alive, iterate over the session and calculate memory
+        let (memory, virtual_memory, gpu_memory, start_time, run_time) = match self
+            .session_processes
+            .get(session_id)
+        {
+            Some(ref lineage) => {
+                // Process session data
+                lineage
+                    .iter()
+                    .filter_map(|pid| {
+                        match self.cached_processes.get(pid) {
+                            Some(proc) if !proc.is_dead() => {
+                                // Confirm this is a proc and not a thread
+                                let start_time_str = DateTime::<Local>::from(
+                                    UNIX_EPOCH + Duration::from_secs(proc.start_time),
+                                )
+                                .format("%Y-%m-%d %H:%M:%S")
+                                .to_string();
+                                let proc_memory = proc.memory;
+                                let proc_vmemory = proc.virtual_memory;
+                                let cmdline = proc.cmd.clone();
+
+                                // Check for potential duplicates
+                                children.push(ProcStats {
+                                    stat: Some(Stat {
+                                        rss: proc_memory as i64,
+                                        vsize: proc_vmemory as i64,
+                                        state: proc.state.clone(),
+                                        name: proc.name.clone(),
+                                        pid: pid.to_string(),
+                                    }),
+                                    statm: None,
+                                    status: None,
+                                    cmdline,
+                                    start_time: start_time_str,
+                                });
+                                Some((proc_memory, proc_vmemory, 0, proc.start_time, proc.run_time))
+                            }
+                            _ => None,
+                        }
+                    })
+                    .reduce(|a, b| {
+                        (
+                            a.0 + b.0,
+                            a.1 + b.1,
+                            a.2 + b.2,
+                            std::cmp::min(a.3, b.3),
+                            std::cmp::max(a.4, b.4),
+                        )
+                    })
+                    .unwrap_or((0, 0, 0, u64::MAX, 0))
+            }
+            None => (0, 0, 0, u64::MAX, 0),
+        };
+        Some(SessionData {
+            memory,
+            virtual_memory,
+            gpu_memory,
+            start_time,
+            run_time,
+            lineage_stats: children,
+        })
+    }
     /// Calculates memory usage of all processes associated with a session ID.
     ///
     /// This method aggregates memory statistics for a process and all of its children
@@ -702,7 +930,7 @@ impl UnixSystem {
     ///
     /// Returns `None` if the process that created the session ID doesn't exist or cannot be
     /// accessed.
-    fn calculate_proc_session_data(&self, session_id: &u32) -> Option<SessionData> {
+    fn _calculate_proc_session_data_old(&self, session_id: &u32) -> Option<SessionData> {
         self.monitored_sessions.insert(*session_id);
 
         let mut sysinfo = self
@@ -812,7 +1040,7 @@ impl SystemManager for UnixSystem {
             total_swap: self.static_info.total_swap,
             num_sockets: self.static_info.num_sockets,
             cores_per_socket: self.static_info.cores_per_socket,
-            boot_time: self.static_info.boot_time,
+            boot_time: self.static_info.boot_time as u32,
             tags: self.static_info.tags.clone(),
             available_memory: dinamic_stat.available_memory,
             free_swap: dinamic_stat.free_swap,
@@ -1819,6 +2047,7 @@ mod tests {
             sysinfo_system: Mutex::new(sysinfo::System::new()),
             session_processes: DashMap::new(),
             monitored_sessions: DashSet::new(),
+            cached_processes: DashMap::new(),
         }
     }
 }
