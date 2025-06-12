@@ -20,7 +20,7 @@ use opencue_proto::{
     host::HardwareState,
     report::{ChildrenProcStats, ProcStats, Stat},
 };
-use sysinfo::{DiskRefreshKind, Disks, MemoryRefreshKind, ProcessStatus, RefreshKind};
+use sysinfo::{DiskRefreshKind, Disks, MemoryRefreshKind, RefreshKind};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -71,7 +71,7 @@ struct ProcessData {
 
 impl ProcessData {
     pub fn is_dead(&self) -> bool {
-        false
+        matches!(self.state.as_str(), "Z" | "X" | "Dead" | "Zombie")
     }
 }
 
@@ -350,13 +350,13 @@ impl LinuxSystem {
     /// # Returns
     ///
     /// A `Result` containing a `String` representing the distribution ID.
-    fn read_distro(distro_relese_path: &str) -> Result<String> {
-        let distro_info = File::open(distro_relese_path).into_diagnostic()?;
+    fn read_distro(distro_release_path: &str) -> Result<String> {
+        let distro_info = File::open(distro_release_path).into_diagnostic()?;
         let reader = BufReader::new(distro_info);
         let mut distro_id: Option<String> = None;
         for line_res in reader.lines().into_iter() {
             if let Ok(line) = line_res {
-                if line.contains("ID") {
+                if line.starts_with("ID=") {
                     distro_id = line
                         .split_once("=")
                         .and_then(|(_, val)| Some(val.replace("\"", "")));
@@ -678,7 +678,7 @@ impl LinuxSystem {
 
             // Remove ()
             let name = if name.len() > 2 {
-                name[1..name.len() - 2].to_string()
+                name[1..name.len() - 1].to_string()
             } else {
                 name
             };
@@ -724,26 +724,6 @@ impl LinuxSystem {
         let start_time = self.static_info.boot_time_secs + start_time_without_boot_time;
         let run_time = now_epoch.saturating_sub(start_time);
         (start_time, run_time)
-    }
-
-    /// Checks if a process is dead or non-existent
-    ///
-    /// # Arguments
-    /// * `process` - An optional reference to a sysinfo::Process
-    ///
-    /// # Returns
-    /// * `bool` - Returns true if the process is dead, zombied, or doesn't exist (None).
-    ///           Returns false if the process exists and is in any other state.
-    fn _is_proc_dead(process: Option<&sysinfo::Process>) -> bool {
-        match process {
-            Some(proc)
-                if vec![ProcessStatus::Dead, ProcessStatus::Zombie].contains(&proc.status()) =>
-            {
-                true
-            }
-            None => true,
-            _ => false,
-        }
     }
 
     fn calculate_proc_session_data(&self, session_id: &u32) -> Option<SessionData> {

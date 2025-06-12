@@ -56,24 +56,6 @@ pub struct MacOsSystem {
     // Cache of monitored processes and their lineage
     session_processes: DashMap<u32, Vec<u32>>,
     monitored_sessions: DashSet<u32>,
-    cached_processes: DashMap<u32, ProcessData>,
-}
-
-#[derive(Debug)]
-struct ProcessData {
-    memory: u64,
-    virtual_memory: u64,
-    cmd: String,
-    state: String,
-    name: String,
-    start_time: u64,
-    run_time: u64,
-}
-
-impl ProcessData {
-    pub fn is_dead(&self) -> bool {
-        false
-    }
 }
 
 #[derive(Debug)]
@@ -180,7 +162,6 @@ impl MacOsSystem {
             sysinfo_system: Mutex::new(sysinfo::System::new()),
             session_processes: DashMap::new(),
             monitored_sessions: DashSet::new(),
-            cached_processes: DashMap::new(),
         })
     }
 
@@ -607,7 +588,7 @@ impl MacOsSystem {
     /// # Returns
     /// * `bool` - Returns true if the process is dead, zombied, or doesn't exist (None).
     ///           Returns false if the process exists and is in any other state.
-    fn _is_proc_dead(process: Option<&sysinfo::Process>) -> bool {
+    fn is_proc_dead(process: Option<&sysinfo::Process>) -> bool {
         match process {
             Some(proc)
                 if vec![ProcessStatus::Dead, ProcessStatus::Zombie].contains(&proc.status()) =>
@@ -619,81 +600,6 @@ impl MacOsSystem {
         }
     }
 
-    fn calculate_proc_session_data(&self, session_id: &u32) -> Option<SessionData> {
-        let mut children = Vec::new();
-        self.monitored_sessions.insert(*session_id);
-
-        let _session_leader = self
-            .cached_processes
-            .get(session_id)
-            .and_then(|proc| match proc.is_dead() {
-                true => None,
-                false => Some(proc),
-            })?;
-
-        // If session owner is still alive, iterate over the session and calculate memory
-        let (memory, virtual_memory, gpu_memory, start_time, run_time) = match self
-            .session_processes
-            .get(session_id)
-        {
-            Some(ref lineage) => {
-                // Process session data
-                lineage
-                    .iter()
-                    .filter_map(|pid| {
-                        match self.cached_processes.get(pid) {
-                            Some(proc) if !proc.is_dead() => {
-                                // Confirm this is a proc and not a thread
-                                let start_time_str = DateTime::<Local>::from(
-                                    UNIX_EPOCH + Duration::from_secs(proc.start_time),
-                                )
-                                .format("%Y-%m-%d %H:%M:%S")
-                                .to_string();
-                                let proc_memory = proc.memory;
-                                let proc_vmemory = proc.virtual_memory;
-                                let cmdline = proc.cmd.clone();
-
-                                // Check for potential duplicates
-                                children.push(ProcStats {
-                                    stat: Some(Stat {
-                                        rss: proc_memory as i64,
-                                        vsize: proc_vmemory as i64,
-                                        state: proc.state.clone(),
-                                        name: proc.name.clone(),
-                                        pid: pid.to_string(),
-                                    }),
-                                    statm: None,
-                                    status: None,
-                                    cmdline,
-                                    start_time: start_time_str,
-                                });
-                                Some((proc_memory, proc_vmemory, 0, proc.start_time, proc.run_time))
-                            }
-                            _ => None,
-                        }
-                    })
-                    .reduce(|a, b| {
-                        (
-                            a.0 + b.0,
-                            a.1 + b.1,
-                            a.2 + b.2,
-                            std::cmp::min(a.3, b.3),
-                            std::cmp::max(a.4, b.4),
-                        )
-                    })
-                    .unwrap_or((0, 0, 0, u64::MAX, 0))
-            }
-            None => (0, 0, 0, u64::MAX, 0),
-        };
-        Some(SessionData {
-            memory,
-            virtual_memory,
-            gpu_memory,
-            start_time,
-            run_time,
-            lineage_stats: children,
-        })
-    }
     /// Calculates memory usage of all processes associated with a session ID.
     ///
     /// This method aggregates memory statistics for a process and all of its children
@@ -716,7 +622,7 @@ impl MacOsSystem {
     ///
     /// Returns `None` if the process that created the session ID doesn't exist or cannot be
     /// accessed.
-    fn _calculate_proc_session_data_old(&self, session_id: &u32) -> Option<SessionData> {
+    fn calculate_proc_session_data(&self, session_id: &u32) -> Option<SessionData> {
         self.monitored_sessions.insert(*session_id);
 
         let mut sysinfo = self
@@ -734,7 +640,7 @@ impl MacOsSystem {
         );
 
         // Return none if the session owner has already finished or died
-        if Self::_is_proc_dead(sysinfo.process(session_pid)) {
+        if Self::is_proc_dead(sysinfo.process(session_pid)) {
             return None;
         }
         // If session owner is still alive, iterate over the session and calculate memory
@@ -755,7 +661,7 @@ impl MacOsSystem {
                         );
 
                         match sysinfo.process(Pid::from(pid.clone() as usize)) {
-                            Some(proc) if !Self::_is_proc_dead(Some(proc)) => {
+                            Some(proc) if !Self::is_proc_dead(Some(proc)) => {
                                 // Confirm this is a proc and not a thread
                                 let start_time_str = DateTime::<Local>::from(
                                     UNIX_EPOCH + Duration::from_secs(proc.start_time()),
@@ -1821,7 +1727,6 @@ mod tests {
             sysinfo_system: Mutex::new(sysinfo::System::new()),
             session_processes: DashMap::new(),
             monitored_sessions: DashSet::new(),
-            cached_processes: DashMap::new(),
         }
     }
 }
