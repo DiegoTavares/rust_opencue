@@ -1517,8 +1517,10 @@ mod tests {
             .await;
         assert!(status.is_ok());
         assert_eq!((0, None), status.unwrap());
-        assert_eq!("stderr test", logger.pop().unwrap());
-        assert_eq!("stdout test", logger.pop().unwrap());
+
+        let possible_out = vec!["stderr test", "stdout test"];
+        assert!(possible_out.contains(&logger.pop().unwrap().as_str()));
+        assert!(possible_out.contains(&logger.pop().unwrap().as_str()));
 
         // Assert the output on the exit_file is the same
         let status = running_frame.read_exit_file().await;

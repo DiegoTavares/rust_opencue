@@ -6,10 +6,8 @@ use std::{
     path::Path,
     process::Command,
     sync::Mutex,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
-
-use libc::{_SC_CLK_TCK, _SC_PAGESIZE};
 
 use chrono::{DateTime, Local};
 use dashmap::{DashMap, DashSet};
@@ -34,7 +32,7 @@ use super::manager::{
     SystemManager,
 };
 
-pub struct UnixSystem {
+pub struct MacOsSystem {
     config: MachineConfig,
 
     /// Map of procids indexed by physid and coreid
@@ -96,8 +94,6 @@ struct MachineStaticInfo {
     pub hyperthreading_multiplier: u32,
     pub boot_time_secs: u64,
     pub tags: Vec<String>,
-    pub page_size: u64,
-    pub clock_tick: u64,
 }
 
 pub struct MachineDynamicInfo {
@@ -125,7 +121,7 @@ struct SessionData {
     lineage_stats: Vec<ProcStats>,
 }
 
-impl UnixSystem {
+impl MacOsSystem {
     /// Initialize the unix sstats collector which reads Cpu and Memory information from
     /// the OS.
     ///
@@ -143,7 +139,7 @@ impl UnixSystem {
             .clone()
             .and_then(|c| c.os)
             .unwrap_or_else(|| {
-                Self::read_distro(&config.distro_release_path).unwrap_or("linux".to_string())
+                Self::read_distro(&config.distro_release_path).unwrap_or("macos".to_string())
             });
 
         // Initialize sysinfo collector
@@ -167,8 +163,6 @@ impl UnixSystem {
                 hyperthreading_multiplier: processor_info.hyperthreading_multiplier,
                 boot_time_secs: Self::read_boot_time(&config.proc_stat_path).unwrap_or(0),
                 tags: Self::setup_tags(&config),
-                page_size: unsafe { libc::sysconf(_SC_PAGESIZE) as u64 },
-                clock_tick: unsafe { libc::sysconf(_SC_CLK_TCK) as u64 },
             },
             // dynamic_info: None,
             hardware_state: HardwareState::Up,
@@ -436,18 +430,6 @@ impl UnixSystem {
         Ok(override_workstation_mode)
     }
 
-    #[cfg(target_os = "macos")]
-    fn calc_available_memory(total_memory: u64, used_memory: u64, _available_memory: u64) -> u64 {
-        // sysinfo.available_memory() would be the best way to infer available memory, but it
-        // returns 0 on M macs
-        total_memory - used_memory
-    }
-
-    #[cfg(target_os = "linux")]
-    fn calc_available_memory(_total_memory: u64, _used_memory: u64, available_memory: u64) -> u64 {
-        available_memory
-    }
-
     fn read_dynamic_stat(&self) -> Result<MachineDynamicInfo> {
         let config = &self.config;
         let load = Self::read_load_avg(&config.proc_loadavg_path)?;
@@ -459,11 +441,9 @@ impl UnixSystem {
         sysinfo.refresh_memory();
 
         Ok(MachineDynamicInfo {
-            available_memory: Self::calc_available_memory(
-                sysinfo.total_memory(),
-                sysinfo.used_memory(),
-                sysinfo.available_memory(),
-            ),
+            // sysinfo.available_memory() would be the best way to infer available memory, but it
+            // returns 0 on M macs
+            available_memory: sysinfo.total_memory() - sysinfo.used_memory(),
             free_swap: sysinfo.free_swap(),
             total_temp_storage: total_space,
             free_temp_storage: available_space,
@@ -574,184 +554,12 @@ impl UnixSystem {
         Ok(available_cores.collect())
     }
 
-    fn refresh_procs_cache(&self) -> Result<()> {
-        let proc_dir = std::fs::read_dir("/proc")
-            .into_diagnostic()
-            .wrap_err("Failed to read /proc")?;
-
-        self.session_processes.clear();
-
-        for entry in proc_dir.flatten() {
-            let pid = match entry.file_name().to_string_lossy().parse::<u32>() {
-                Ok(pid) => pid,
-                Err(_) => continue, // Skip non-pid paths
-            };
-
-            let stat_path = format!("/proc/{}/status", pid);
-            let stat = std::fs::read_to_string(stat_path).into_diagnostic()?;
-
-            // Fields
-            let mut session_id: Option<u32> = None;
-            let mut tgid: Option<u32> = None;
-            let mut state = None;
-
-            for line in stat.lines() {
-                match line.split_once(":") {
-                    Some((key, value)) => match key {
-                        "Tgid" => {
-                            tgid = value.trim().parse().ok();
-                        }
-                        "NSsid" => {
-                            session_id = value.trim().parse().ok();
-                        }
-                        "SID" => {
-                            session_id = value.trim().parse().ok();
-                        }
-                        "State" => {
-                            state = value.trim().split_whitespace().next();
-                        }
-                        _ => (),
-                    },
-                    None => (),
-                }
-            }
-            match (session_id, tgid, state) {
-                (Some(session_id), Some(tgid), Some(state)) => {
-                    // Only store valid states
-                    let valid_state = match state {
-                        "R" | "S" | "D" | "T" => true, // Running, Sleeping, Disk Sleep, Stopped
-                        "Z" | "X" => false,            // Zombie, Dead
-                        _ => true,                     // Monitor unkwnown states
-                    };
-
-                    let is_group_leader = pid == tgid;
-
-                    if session_id != 0
-                        && self.monitored_sessions.contains(&session_id)
-                        && is_group_leader
-                        && valid_state
-                    {
-                        if let Ok(process_data) = self.read_proc_data(pid) {
-                            self.cached_processes.insert(pid, process_data);
-                            self.session_processes
-                                .entry(session_id)
-                                .or_default()
-                                .push(pid);
-                        } // Skip processes that failed to be read
-                    }
-                }
-                _ => todo!(),
-            }
-        }
-        Ok(())
-    }
-
-    /// Reads proc data from stat and statm files:
-    ///
-    /// # Used fields:
-    ///
-    /// ## /proc/pid/stat
-    /// 1. **comm** (%s) - The filename of the executable in parentheses (truncated to 16 chars including null terminator)
-    /// 2. **state** (%c) - Process state: R (Running), S (Sleeping), D (Uninterruptible sleep), Z (Zombie), T (Stopped), t (Tracing stop), X/x (Dead), K (Wakekill), W (Waking), P (Parked), I (Idle)
-    /// 21. **starttime** (%llu) - Process start time after system boot in clock ticks
-    ///
-    /// ## /proc/pid/statm
-    /// 0. **size** (%d) - Total program size
-    /// 1. **rss** (%d) - Resident set Size
-    ///
-    /// ## /proc/pid/cmdline
-    fn read_proc_data(&self, pid: u32) -> Result<ProcessData> {
-        let stat_path = format!("/proc/{}/stat", pid);
-        let statm_path = format!("/proc/{}/statm", pid);
-        let cmdline_path = format!("/proc/{}/cmdline", pid);
-        let stat = std::fs::read_to_string(stat_path).into_diagnostic()?;
-        let statm = std::fs::read_to_string(statm_path).into_diagnostic()?;
-        let cmdline = std::fs::read_to_string(cmdline_path).into_diagnostic()?;
-
-        let fields_stat: Vec<&str> = stat.split_whitespace().collect();
-        let fields_statm: Vec<&str> = statm.split_whitespace().collect();
-        if fields_stat.len() >= 22 && fields_statm.len() >= 6 {
-            // Unpack values
-            let (state, name, start_time) = match (
-                fields_stat.get(2),             // state
-                fields_stat.get(1),             // name
-                fields_stat[21].parse::<u64>(), // starttime
-            ) {
-                (Some(state), Some(name), Ok(start_time)) => {
-                    (state.to_string(), name.to_string(), start_time)
-                }
-                _ => Err(miette!("Invalid /proc/{pid}/stat file"))?,
-            };
-
-            let (vsize, rss) = match (
-                fields_statm[0].parse::<u64>(), // size
-                fields_statm[1].parse::<u64>(), // rss
-            ) {
-                (Ok(vsize), Ok(rss)) => (vsize, rss),
-                _ => Err(miette!("Invalid /proc/{pid}/statm file"))?,
-            };
-
-            let (start_time, run_time) = self.calculate_process_time(start_time);
-            // Rss is stored in number of pages
-            let memory = rss.saturating_mul(self.static_info.page_size);
-            let virtual_memory = vsize.saturating_mul(self.static_info.page_size);
-
-            // Remove ()
-            let name = if name.len() > 2 {
-                name[1..name.len() - 2].to_string()
-            } else {
-                name
-            };
-
-            let cmd = cmdline.replace('\0', " ");
-
-            Ok(ProcessData {
-                memory,
-                virtual_memory,
-                cmd,
-                state,
-                name,
-                start_time,
-                run_time,
-            })
-        } else {
-            Err(miette!("Invalid /proc/stat file for {pid}"))
-        }
-    }
-
-    /// Calculates the absolute start time and total runtime for a process.
-    ///
-    /// This function converts the process start time from the kernel's internal representation
-    /// (clock ticks since system boot) to useful absolute timestamps and runtime duration.
-    ///
-    /// # Arguments
-    ///
-    /// * `start_time_after_boot_in_cycles` - The process start time in clock ticks since system boot,
-    ///   as reported by field 22 (`starttime`) in `/proc/pid/stat`.
-    ///
-    /// # Returns
-    ///
-    /// A tuple containing:
-    /// * `start_time` - Absolute process start time as seconds since Unix epoch (UTC)
-    /// * `run_time` - Total process runtime in seconds from start until now
-    fn calculate_process_time(&self, start_time_after_boot_in_cycles: u64) -> (u64, u64) {
-        let now_epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let start_time_without_boot_time: u64 =
-            start_time_after_boot_in_cycles / self.static_info.clock_tick;
-        let start_time = self.static_info.boot_time_secs + start_time_without_boot_time;
-        let run_time = now_epoch.saturating_sub(start_time);
-        (start_time, run_time)
-    }
-
     /// Refresh the cache of children procs.
     ///
     /// This method relies on sysinfo to have been updated periodically
     /// throught the refresh_procs method to gather the updated list
     /// of running processes
-    fn refresh_procs_cache_less_efficient(&self) {
+    fn refresh_procs_cache(&self) {
         let mut sysinfo = self
             .sysinfo_system
             .lock()
@@ -1009,7 +817,7 @@ impl UnixSystem {
     }
 }
 
-impl SystemManager for UnixSystem {
+impl SystemManager for MacOsSystem {
     fn collect_stats(&self) -> Result<MachineStat> {
         let dinamic_stat = self.read_dynamic_stat()?;
         Ok(MachineStat {
@@ -1208,10 +1016,7 @@ impl SystemManager for UnixSystem {
     }
 
     fn refresh_procs(&self) {
-        if let Err(err) = self.refresh_procs_cache() {
-            debug!("{err}. Falling back to less efficient alternative");
-            self.refresh_procs_cache_less_efficient();
-        };
+        self.refresh_procs_cache()
     }
 
     fn kill_session(&self, session_pid: u32) -> Result<()> {
@@ -1251,15 +1056,6 @@ impl SystemManager for UnixSystem {
             .map(|lineage| lineage.clone())
     }
 
-    #[cfg(target_os = "linux")]
-    fn reboot(&self) -> Result<()> {
-        nix::sys::reboot::reboot(nix::sys::reboot::RebootMode::RB_AUTOBOOT)
-            .map(|_| ())
-            .into_diagnostic()
-            .wrap_err("Failed to reboot")
-    }
-
-    #[cfg(target_os = "macos")]
     fn reboot(&self) -> Result<()> {
         Command::new("reboot")
             .status()
@@ -1277,13 +1073,12 @@ mod tests {
 
     use dashmap::{DashMap, DashSet};
     use itertools::Itertools;
-    use libc::{_SC_CLK_TCK, _SC_PAGESIZE};
     use opencue_proto::host::HardwareState;
     use uuid::Uuid;
 
     use crate::system::{
+        macos::{MacOsSystem, MachineStaticInfo},
         manager::{CpuStat, ReservationError, SystemManager},
-        unix::{MachineStaticInfo, UnixSystem},
     };
 
     #[test]
@@ -1299,12 +1094,12 @@ mod tests {
         config.inittab_path = "".to_string();
         config.core_multiplier = 1;
 
-        let linux_monitor = UnixSystem::init(&config)
-            .expect("Initializing LinuxMachineStat failed")
+        let monitor = MacOsSystem::init(&config)
+            .expect("Initializing MacOsMachineStat failed")
             .static_info;
-        assert_eq!(2, linux_monitor.num_sockets);
-        assert_eq!(2, linux_monitor.cores_per_socket);
-        assert_eq!(1, linux_monitor.hyperthreading_multiplier);
+        assert_eq!(2, monitor.num_sockets);
+        assert_eq!(2, monitor.cores_per_socket);
+        assert_eq!(1, monitor.hyperthreading_multiplier);
     }
 
     #[test]
@@ -1361,7 +1156,7 @@ mod tests {
             };
 
             let (cpuinfo, threads_by_core_id, physid_and_coreid_by_procid, _thread_id_lookup_table) =
-                UnixSystem::read_cpuinfo(&file_path).expect("Failed to read file");
+                MacOsSystem::read_cpuinfo(&file_path).expect("Failed to read file");
             // Assert that the mapping between processor ID, physical ID, and core ID is correct
             println!("procid_by_physid_and_core_id={:?}", threads_by_core_id);
             println!(
@@ -1392,7 +1187,7 @@ mod tests {
         config.inittab_path = "".to_string();
         config.core_multiplier = 1;
 
-        let stat = UnixSystem::init(&config).expect("Initializing LinuxMachineStat failed");
+        let stat = MacOsSystem::init(&config).expect("Initializing MacOsSystem failed");
         let static_info = stat.static_info;
 
         // Proc
@@ -1429,7 +1224,7 @@ mod tests {
         let project_dir = env!("CARGO_MANIFEST_DIR");
 
         let path = format!("{}/resources/distro-release/{}", project_dir, id);
-        let release = UnixSystem::read_distro(&path).expect("Failed to read release");
+        let release = MacOsSystem::read_distro(&path).expect("Failed to read release");
 
         assert_eq!(id.to_string(), release);
     }
@@ -1439,7 +1234,7 @@ mod tests {
         let project_dir = env!("CARGO_MANIFEST_DIR");
 
         let path = format!("{}/resources/proc/stat", project_dir);
-        let boot_time = UnixSystem::read_boot_time(&path).expect("Failed to read boot time");
+        let boot_time = MacOsSystem::read_boot_time(&path).expect("Failed to read boot time");
         assert_eq!(1720194269, boot_time);
     }
 
@@ -1451,23 +1246,23 @@ mod tests {
         // Test successful case
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "1.00 2.00 3.00 4/512 12345").unwrap();
-        let result = UnixSystem::read_load_avg(temp_file.path().to_str().unwrap());
+        let result = MacOsSystem::read_load_avg(temp_file.path().to_str().unwrap());
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), (1.0, 2.0, 3.0));
 
         // Test empty file
         let empty_file = NamedTempFile::new().unwrap();
-        let result = UnixSystem::read_load_avg(empty_file.path().to_str().unwrap());
+        let result = MacOsSystem::read_load_avg(empty_file.path().to_str().unwrap());
         assert!(result.is_err());
 
         // Test invalid format
         let mut invalid_file = NamedTempFile::new().unwrap();
         writeln!(invalid_file, "invalid format").unwrap();
-        let result = UnixSystem::read_load_avg(invalid_file.path().to_str().unwrap());
+        let result = MacOsSystem::read_load_avg(invalid_file.path().to_str().unwrap());
         assert!(result.is_err());
 
         // Test non-existent file
-        let result = UnixSystem::read_load_avg("nonexistent_file");
+        let result = MacOsSystem::read_load_avg("nonexistent_file");
         assert!(result.is_err());
     }
 
@@ -1484,7 +1279,7 @@ mod tests {
         config.inittab_path = "".to_string();
         config.core_multiplier = 1;
 
-        let result = UnixSystem::init(&config);
+        let result = MacOsSystem::init(&config);
         assert!(result.is_ok());
 
         let system = result.unwrap();
@@ -1505,7 +1300,7 @@ mod tests {
         writeln!(temp_file, "cpu0 123 456 789").unwrap();
         writeln!(temp_file, "malformed_btime_line").unwrap();
 
-        let result = UnixSystem::read_boot_time(temp_file.path().to_str().unwrap());
+        let result = MacOsSystem::read_boot_time(temp_file.path().to_str().unwrap());
         assert!(result.is_err());
     }
 
@@ -1521,7 +1316,7 @@ mod tests {
         config.temp_path = "/tmp".to_string();
         config.inittab_path = "".to_string();
 
-        let system = UnixSystem::init(&config).unwrap();
+        let system = MacOsSystem::init(&config).unwrap();
 
         // Test dynamic stats collection
         use crate::system::manager::SystemManager;
@@ -1546,7 +1341,7 @@ mod tests {
         config.proc_stat_path = "".to_string();
         config.inittab_path = "".to_string();
 
-        let mut system = UnixSystem::init(&config).unwrap();
+        let mut system = MacOsSystem::init(&config).unwrap();
         let frame_id = uuid::Uuid::new_v4();
 
         // Reserve cores
@@ -1580,7 +1375,7 @@ mod tests {
         config.proc_stat_path = "".to_string();
         config.inittab_path = "".to_string();
 
-        let system = UnixSystem::init(&config).unwrap();
+        let system = MacOsSystem::init(&config).unwrap();
 
         // This should not panic or fail
         use crate::system::manager::SystemManager;
@@ -1603,7 +1398,7 @@ mod tests {
         config.inittab_path = "".to_string();
         config.custom_tags = vec!["test_tag".to_string(), "integration".to_string()];
 
-        let system = UnixSystem::init(&config).unwrap();
+        let system = MacOsSystem::init(&config).unwrap();
 
         assert_eq!(system.static_info.tags.len(), 2);
         assert!(system.static_info.tags.contains(&"test_tag".to_string()));
@@ -1961,7 +1756,7 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let empty_file = NamedTempFile::new().unwrap();
-        let result = UnixSystem::read_distro(empty_file.path().to_str().unwrap());
+        let result = MacOsSystem::read_distro(empty_file.path().to_str().unwrap());
         assert!(result.is_err());
     }
 
@@ -1975,150 +1770,12 @@ mod tests {
         assert_eq!(static_info.hostname, "test");
     }
 
-    #[test]
-    fn test_calculate_process_time_basic() {
-        let system = setup_test_system(4, 2, 1);
-
-        // Mock scenario: process started 1000 clock ticks after boot
-        // Assuming _SC_CLK_TCK = 100 (typical value)
-        let clock_ticks = 1000_u64;
-        let expected_seconds_after_boot =
-            clock_ticks / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-
-        let (start_time, run_time) = system.calculate_process_time(clock_ticks);
-
-        // start_time should be boot_time + seconds_after_boot
-        let expected_start_time = system.static_info.boot_time_secs + expected_seconds_after_boot;
-        assert_eq!(start_time, expected_start_time);
-
-        // run_time should be reasonable (test system has boot_time_secs = 0, so run_time will be large)
-        // Just verify it's a finite value and greater than expected_seconds_after_boot
-        assert!(run_time > expected_seconds_after_boot);
-        assert!(run_time < u64::MAX);
-    }
-
-    #[test]
-    fn test_calculate_process_time_zero_start() {
-        let system = setup_test_system(4, 2, 1);
-
-        // Process that started exactly at boot (0 clock ticks)
-        let (start_time, run_time) = system.calculate_process_time(0);
-
-        // start_time should equal boot_time_secs
-        assert_eq!(start_time, system.static_info.boot_time_secs);
-
-        // run_time should be reasonable (test system has boot_time_secs = 0, so run_time will be current epoch time)
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        assert!(run_time > 0);
-        assert!(run_time <= now); // Should not exceed current time
-    }
-
-    #[test]
-    fn test_calculate_process_time_large_value() {
-        let system = setup_test_system(4, 2, 1);
-
-        // Test with a large number of clock ticks
-        let clock_ticks = 1_000_000_u64;
-        let expected_seconds_after_boot =
-            clock_ticks / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-
-        let (start_time, run_time) = system.calculate_process_time(clock_ticks);
-
-        let expected_start_time = system.static_info.boot_time_secs + expected_seconds_after_boot;
-        assert_eq!(start_time, expected_start_time);
-
-        // For a process that started far in the past, run_time should be reasonable
-        // (we can't predict exact values due to real system time, but it should be finite)
-        assert!(run_time < u64::MAX);
-    }
-
-    #[test]
-    fn test_calculate_process_time_consistency() {
-        let system = setup_test_system(4, 2, 1);
-
-        let clock_ticks_1 = 500_u64;
-        let clock_ticks_2 = 1000_u64;
-
-        let (start_time_1, _) = system.calculate_process_time(clock_ticks_1);
-        let (start_time_2, _) = system.calculate_process_time(clock_ticks_2);
-
-        // Process 2 should have started later than process 1
-        assert!(start_time_2 > start_time_1);
-
-        // The difference should match the expected clock tick difference
-        let expected_diff =
-            (clock_ticks_2 - clock_ticks_1) / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-        let actual_diff = start_time_2 - start_time_1;
-        assert_eq!(actual_diff, expected_diff);
-    }
-
-    #[test]
-    fn test_calculate_process_time_edge_case_max_value() {
-        let system = setup_test_system(4, 2, 1);
-
-        // Test with maximum reasonable value
-        let clock_ticks = u64::MAX / 2; // Avoid overflow in calculations
-        let (start_time, run_time) = system.calculate_process_time(clock_ticks);
-
-        // Should not panic or overflow
-        assert!(start_time >= system.static_info.boot_time_secs);
-        // run_time uses saturating_sub, so it should never overflow
-        assert!(run_time <= u64::MAX);
-    }
-
-    #[test]
-    fn test_calculate_process_time_runtime_calculation() {
-        let mut system = setup_test_system(4, 2, 1);
-
-        // Set a known boot time for predictable testing
-        system.static_info.boot_time_secs = 1609459200; // 2021-01-01 00:00:00 UTC
-
-        // Process started 10 seconds after boot (1000 clock ticks assuming 100 Hz)
-        let clock_ticks = 1000_u64;
-        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-        let expected_start_time = system.static_info.boot_time_secs + (clock_ticks / clk_tck);
-
-        let (start_time, run_time) = system.calculate_process_time(clock_ticks);
-
-        assert_eq!(start_time, expected_start_time);
-
-        // run_time should be the difference between now and start_time
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let expected_run_time = now.saturating_sub(start_time);
-        assert_eq!(run_time, expected_run_time);
-    }
-
-    #[test]
-    fn test_calculate_process_time_multiple_calls_consistent() {
-        let system = setup_test_system(4, 2, 1);
-
-        let clock_ticks = 5000_u64;
-
-        // Multiple calls with same input should produce same start_time
-        let (start_time_1, run_time_1) = system.calculate_process_time(clock_ticks);
-        std::thread::sleep(std::time::Duration::from_millis(10)); // Small delay
-        let (start_time_2, run_time_2) = system.calculate_process_time(clock_ticks);
-
-        // Start time should be identical
-        assert_eq!(start_time_1, start_time_2);
-
-        // Run time should be slightly different (or same if calls were very fast)
-        assert!(run_time_2 >= run_time_1);
-        assert!(run_time_2 - run_time_1 <= 1); // Should differ by at most 1 second
-    }
-
     // Helper function to create a test system with specified configuration
     fn setup_test_system(
         total_cores: u32,
         physical_cpus: u32,
         threads_per_core: u32,
-    ) -> UnixSystem {
+    ) -> MacOsSystem {
         let mut cores_by_phys_id = HashMap::new();
         let mut threads_by_core_unique_id: HashMap<String, Vec<u32>> = HashMap::new();
         let mut thread_id_lookup_table: HashMap<u32, (u32, u32)> = HashMap::new();
@@ -2141,7 +1798,7 @@ mod tests {
             cores_by_phys_id.insert(phys_id, (0..cores_per_cpu).collect());
         }
 
-        UnixSystem {
+        MacOsSystem {
             config: MachineConfig::default(),
             cores_by_phys_id,
             threads_by_core_unique_id,
@@ -2158,8 +1815,6 @@ mod tests {
                 hyperthreading_multiplier: 1,
                 boot_time_secs: 0,
                 tags: vec![],
-                page_size: unsafe { libc::sysconf(_SC_PAGESIZE) as u64 },
-                clock_tick: unsafe { libc::sysconf(_SC_CLK_TCK) as u64 },
             },
             hardware_state: HardwareState::Up,
             attributes: HashMap::new(),
