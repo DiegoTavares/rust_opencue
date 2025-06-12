@@ -1,4 +1,8 @@
+#[cfg(unix)]
 use std::os::fd::IntoRawFd;
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::time::SystemTime;
 use std::{
@@ -6,7 +10,6 @@ use std::{
     collections::HashMap,
     env,
     fmt::Display,
-    os::fd::{FromRawFd, RawFd},
     path::Path,
     process::ExitStatus,
     str::FromStr,

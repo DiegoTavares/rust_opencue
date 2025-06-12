@@ -150,6 +150,16 @@ impl LinuxSystem {
         let total_memory = sysinfo.total_memory();
         let total_swap = sysinfo.total_swap();
 
+        // Both sysconf values return -1 if not available
+        let page_size: u64 = unsafe { libc::sysconf(_SC_PAGESIZE) }
+            .try_into()
+            .into_diagnostic()
+            .wrap_err("SC_PAGESIZE not available")?;
+        let clock_tick: u64 = unsafe { libc::sysconf(_SC_CLK_TCK) }
+            .try_into()
+            .into_diagnostic()
+            .wrap_err("SC_CLK_TCK not available")?;
+
         Ok(Self {
             config: config.clone(),
             cores_by_phys_id,
@@ -164,8 +174,8 @@ impl LinuxSystem {
                 hyperthreading_multiplier: processor_info.hyperthreading_multiplier,
                 boot_time_secs: Self::read_boot_time(&config.proc_stat_path).unwrap_or(0),
                 tags: Self::setup_tags(&config),
-                page_size: unsafe { libc::sysconf(_SC_PAGESIZE) as u64 },
-                clock_tick: unsafe { libc::sysconf(_SC_CLK_TCK) as u64 },
+                page_size,
+                clock_tick,
             },
             // dynamic_info: None,
             hardware_state: HardwareState::Up,
@@ -251,6 +261,9 @@ impl LinuxSystem {
                     .unwrap_or(&"1".to_string())
                     .parse()
                     .unwrap_or(1);
+                if cpu_cores == 0 {
+                    Err(miette!("Invalid 'cpu cores'=0 on cpuinfo file."))?
+                }
                 hyperthreading_multiplier.replace(siblings / cpu_cores);
                 num_threads += 1;
 
@@ -293,6 +306,9 @@ impl LinuxSystem {
         }
         // Apply modifier
         let hyper_modifier = hyperthreading_multiplier.unwrap_or(1);
+        if hyper_modifier == 0 {
+            Err(miette!("Invalid hyperthreading_multiplier=0"))?
+        }
         num_threads = num_threads / hyper_modifier;
         if num_sockets == 0 {
             Err(miette!("Invalid CPU with no sockets (physical id)"))
@@ -356,7 +372,7 @@ impl LinuxSystem {
         let mut distro_id: Option<String> = None;
         for line_res in reader.lines().into_iter() {
             if let Ok(line) = line_res {
-                if line.starts_with("ID=") {
+                if line.starts_with("ID=") || line.starts_with("DISTRIB_ID") {
                     distro_id = line
                         .split_once("=")
                         .and_then(|(_, val)| Some(val.replace("\"", "")));
@@ -569,7 +585,10 @@ impl LinuxSystem {
             };
 
             let stat_path = format!("/proc/{}/status", pid);
-            let stat = std::fs::read_to_string(stat_path).into_diagnostic()?;
+            let stat = match std::fs::read_to_string(stat_path).into_diagnostic() {
+                Ok(s) => s,
+                Err(_) => continue, // Skip procs which status is not available
+            };
 
             // Fields
             let mut session_id: Option<u32> = None;
