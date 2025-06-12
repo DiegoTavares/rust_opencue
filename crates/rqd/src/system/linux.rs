@@ -618,7 +618,9 @@ impl LinuxSystem {
                         } // Skip processes that failed to be read
                     }
                 }
-                _ => todo!(),
+                _ => {
+                    continue;
+                }
             }
         }
         Ok(())

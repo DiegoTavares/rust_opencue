@@ -1154,7 +1154,7 @@ impl RunningFrame {
             .into_diagnostic()
             .map_err(|e| miette!("Failed to serialize frame snapshot: {}", e))?;
         writer
-            .write(&serialized_data)
+            .write_all(&serialized_data)
             .await
             .into_diagnostic()
             .map_err(|e| miette!("Failed to write frame snapshot: {}", e))?;
