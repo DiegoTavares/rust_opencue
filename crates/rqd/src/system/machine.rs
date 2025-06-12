@@ -70,12 +70,11 @@ impl MachineMonitor {
     /// Initializes the object without starting the monitor loop
     /// Will gather the initial state of this machine
     pub fn init(config: &Config, report_client: Arc<ReportClient>) -> Result<Self> {
-        // Use a combination of debug assertions and target_os to ensure both versions are compiled at
-        // debug mode
-        #[cfg(any(target_os = "macos", all(debug_assertions)))]
+        #[cfg(any(target_os = "macos"))]
         #[allow(unused_variables)]
         let system_manager: SystemManagerType = Box::new(MacOsSystem::init(&config.machine)?);
 
+        // Allow linux logic compilation from mac development environments
         #[cfg(any(target_os = "linux", all(debug_assertions)))]
         let system_manager: SystemManagerType = Box::new(LinuxSystem::init(&config.machine)?);
 
