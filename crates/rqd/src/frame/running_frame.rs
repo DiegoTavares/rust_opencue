@@ -1199,9 +1199,13 @@ impl RunningFrame {
         let file = tokio::fs::File::open(path)
             .await
             .map_err(|err| miette!("Failed to open snapshot file. {}", err))?;
-        let reader = tokio::io::BufReader::new(file);
+        let mut buff = Vec::new();
+        tokio::io::BufReader::new(file)
+            .read_to_end(&mut buff)
+            .await
+            .into_diagnostic()?;
 
-        let mut frame: RunningFrame = bincode::deserialize_from(reader.buffer())
+        let mut frame: RunningFrame = bincode::deserialize(&buff)
             .into_diagnostic()
             .map_err(|e| miette!("Failed to deserialize frame snapshot: {}", e))?;
 

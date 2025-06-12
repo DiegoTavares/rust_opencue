@@ -582,10 +582,7 @@ impl LinuxSystem {
                         "Tgid" => {
                             tgid = value.trim().parse().ok();
                         }
-                        "NSsid" => {
-                            session_id = value.trim().parse().ok();
-                        }
-                        "SID" => {
+                        "NSsid" | "SID" | "Sid" => {
                             session_id = value.trim().parse().ok();
                         }
                         "State" => {
