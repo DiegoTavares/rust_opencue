@@ -10,9 +10,11 @@ use tokio::time;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::{config::config::Config, servant::rqd_servant::MachineImpl};
+#[cfg(feature = "containerized_frames")]
+use super::docker_running_frame;
 
 use super::running_frame::RunningFrame;
+use crate::{config::config::Config, servant::rqd_servant::MachineImpl};
 
 pub struct FrameManager {
     pub config: Config,
@@ -212,10 +214,16 @@ impl FrameManager {
         }
     }
 
+    #[cfg(feature = "containerized_frames")]
     fn spawn_docker_frame(&self, running_frame: Arc<RunningFrame>, recovery_mode: bool) {
         self.machine.add_running_frame(Arc::clone(&running_frame));
         let _thread_handle =
             tokio::spawn(async move { running_frame.run_docker(recovery_mode).await });
+    }
+
+    #[cfg(feature = "default")]
+    fn spawn_docker_frame(&self, _running_frame: Arc<RunningFrame>, _recovery_mode: bool) {
+        todo!("Running on docker requires compiling with the feature containerized_frames")
     }
 
     fn validate_grpc_frame(&self, run_frame: &RunFrame) -> Result<(), FrameManagerError> {

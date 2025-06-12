@@ -163,6 +163,7 @@ impl Default for RunnerConfig {
     }
 }
 
+#[cfg(feature = "containerized_frames")]
 impl RunnerConfig {
     pub fn get_docker_image(&self, image_key: &str) -> String {
         self.docker_images

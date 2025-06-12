@@ -187,6 +187,7 @@ wait_for_output $exit_code
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_become_user(&mut self, uid: u32, gid: u32, username: String) -> &mut Self {
         self.become_user = Some(BecomeUser { uid, gid, username });
         self

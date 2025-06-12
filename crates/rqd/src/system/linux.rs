@@ -545,7 +545,7 @@ impl LinuxSystem {
         let available_cores = all_cores_map
             .into_iter()
             .filter_map(
-                |(phys_id, core_ids_map)| match reserved_cores.get(&phys_id) {
+                |(phys_id, core_ids_map)| match reserved_cores.get(phys_id) {
                     Some(reserved_core_ids) => {
                         // Filter out cores that are present in any of the sockets on the
                         // reserved_cores map
