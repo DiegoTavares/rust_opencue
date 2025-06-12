@@ -6,7 +6,7 @@ use std::{
     path::Path,
     process::Command,
     sync::Mutex,
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use libc::{_SC_CLK_TCK, _SC_PAGESIZE};
@@ -94,8 +94,10 @@ struct MachineStaticInfo {
     pub cores_per_socket: u32,
     // Unlike the python counterpart, the multiplier is not automatically applied to total_procs
     pub hyperthreading_multiplier: u32,
-    pub boot_time: u64,
+    pub boot_time_secs: u64,
     pub tags: Vec<String>,
+    pub page_size: u64,
+    pub clock_tick: u64,
 }
 
 pub struct MachineDynamicInfo {
@@ -163,8 +165,10 @@ impl UnixSystem {
                 num_sockets: processor_info.num_sockets,
                 cores_per_socket: processor_info.cores_per_socket,
                 hyperthreading_multiplier: processor_info.hyperthreading_multiplier,
-                boot_time: Self::read_boot_time(&config.proc_stat_path).unwrap_or(0),
+                boot_time_secs: Self::read_boot_time(&config.proc_stat_path).unwrap_or(0),
                 tags: Self::setup_tags(&config),
+                page_size: unsafe { libc::sysconf(_SC_PAGESIZE) as u64 },
+                clock_tick: unsafe { libc::sysconf(_SC_CLK_TCK) as u64 },
             },
             // dynamic_info: None,
             hardware_state: HardwareState::Up,
@@ -629,11 +633,11 @@ impl UnixSystem {
                     {
                         if let Ok(process_data) = self.read_proc_stat(pid) {
                             self.cached_processes.insert(pid, process_data);
-                        }
-                        self.session_processes
-                            .entry(session_id)
-                            .or_default()
-                            .push(pid);
+                            self.session_processes
+                                .entry(session_id)
+                                .or_default()
+                                .push(pid);
+                        } // Skip processes that failed to be read
                     }
                 }
                 _ => todo!(),
@@ -642,109 +646,55 @@ impl UnixSystem {
         Ok(())
     }
 
-    /// stat fields:
-    /// Basic Process Information
-    // 1. **pid** (%d) - The process ID
-    // 2. **comm** (%s) - The filename of the executable in parentheses (truncated to 16 chars including null terminator)
-    // 3. **state** (%c) - Process state: R (Running), S (Sleeping), D (Uninterruptible sleep), Z (Zombie), T (Stopped), t (Tracing stop), X/x (Dead), K (Wakekill), W (Waking), P (Parked), I (Idle)
-    // 4. **ppid** (%d) - Parent process ID
-    // 5. **pgrp** (%d) - Process group ID
-    // 6. **session** (%d) - Session ID
-    // 7. **tty_nr** (%d) - Controlling terminal (minor device in bits 31-20 & 7-0, major in bits 15-8)
-    // 8. **tpgid** (%d) - Foreground process group ID of controlling terminal
-
-    // ### Process Flags and Fault Counters
-    // 9. **flags** (%u) - Kernel flags word (see PF_* defines in kernel source)
-    // 10. **minflt** (%lu) - Minor page faults (no disk I/O required)
-    // 11. **cminflt** (%lu) - Minor faults of waited-for children
-    // 12. **majflt** (%lu) - Major page faults (disk I/O required)
-    // 13. **cmajflt** (%lu) - Major faults of waited-for children
-
-    // ### CPU Time Information
-    // 14. **utime** (%lu) - User mode CPU time in clock ticks (includes guest time)
-    // 15. **stime** (%lu) - Kernel mode CPU time in clock ticks
-    // 16. **cutime** (%ld) - Children's user mode CPU time in clock ticks
-    // 17. **cstime** (%ld) - Children's kernel mode CPU time in clock ticks
-
-    // ### Scheduling Information
-    // 18. **priority** (%ld) - Scheduling priority (-2 to -100 for RT, 0-39 for normal processes)
-    // 19. **nice** (%ld) - Nice value (-20 to 19)
-    // 20. **num_threads** (%ld) - Number of threads in the process
-    // 21. **itrealvalue** (%ld) - Time until next SIGALRM (obsolete, always 0 since 2.6.17)
-
-    // ### Memory and Runtime Information
-    // 22. **starttime** (%llu) - Process start time after system boot in clock ticks
-    // 23. **vsize** (%lu) - Virtual memory size in bytes
-    // 24. **rss** (%ld) - Resident Set Size in pages (inaccurate, use /proc/pid/statm instead)
-    // 25. **rsslim** (%lu) - Current RSS soft limit in bytes
-
-    // ### Memory Layout (Protected by ptrace permissions [PT])
-    // 26. **startcode** (%lu) [PT] - Address above which program text can run
-    // 27. **endcode** (%lu) [PT] - Address below which program text can run
-    // 28. **startstack** (%lu) [PT] - Stack start address (bottom of stack)
-    // 29. **kstkesp** (%lu) [PT] - Current stack pointer (ESP) value
-    // 30. **kstkeip** (%lu) [PT] - Current instruction pointer (EIP) value
-
-    // ### Signal Information (Obsolete)
-    // 31. **signal** (%lu) - Bitmap of pending signals (obsolete, use /proc/pid/status)
-    // 32. **blocked** (%lu) - Bitmap of blocked signals (obsolete)
-    // 33. **sigignore** (%lu) - Bitmap of ignored signals (obsolete)
-    // 34. **sigcatch** (%lu) - Bitmap of caught signals (obsolete)
-
-    // ### Wait Channel and Swap Information
-    // 35. **wchan** (%lu) [PT] - Wait channel address where process is sleeping
-    // 36. **nswap** (%lu) - Number of pages swapped (not maintained)
-    // 37. **cnswap** (%lu) - Cumulative nswap for children (not maintained)
-
-    // ### Process Termination and CPU Assignment
-    // 38. **exit_signal** (%d) - Signal to send to parent when process dies
-    // 39. **processor** (%d) - CPU number last executed on
-
-    // ### Real-time Scheduling
-    // 40. **rt_priority** (%u) - Real-time priority (1-99 for RT processes, 0 for normal)
-    // 41. **policy** (%u) - Scheduling policy (use SCHED_* constants)
-
-    // ### I/O and Guest Time
-    // 42. **delayacct_blkio_ticks** (%llu) - Aggregated block I/O delays in clock ticks
-    // 43. **guest_time** (%lu) - Time spent running virtual CPU for guest OS
-    // 44. **cguest_time** (%ld) - Children's guest time
-
-    // ### Extended Memory Layout (Protected [PT])
-    // 45. **start_data** (%lu) [PT] - Address above which initialized/uninitialized data is placed
-    // 46. **end_data** (%lu) [PT] - Address below which initialized/uninitialized data is placed
-    // 47. **start_brk** (%lu) [PT] - Address above which heap can be expanded with brk()
-    // 48. **arg_start** (%lu) [PT] - Address above which command-line arguments are placed
-    // 49. **arg_end** (%lu) [PT] - Address below which command-line arguments are placed
-    // 50. **env_start** (%lu) [PT] - Address above which environment variables are placed
-    // 51. **env_end** (%lu) [PT] - Address below which environment variables are placed
-    // 52. **exit_code** (%d) [PT] - Thread's exit status as reported by waitpid()
+    /// Reads proc data from stat and statm files:
+    ///
+    /// # Used fields:
+    ///
+    /// ## /proc/pid/stat
+    /// 1. **comm** (%s) - The filename of the executable in parentheses (truncated to 16 chars including null terminator)
+    /// 2. **state** (%c) - Process state: R (Running), S (Sleeping), D (Uninterruptible sleep), Z (Zombie), T (Stopped), t (Tracing stop), X/x (Dead), K (Wakekill), W (Waking), P (Parked), I (Idle)
+    /// 21. **starttime** (%llu) - Process start time after system boot in clock ticks
+    ///
+    /// ## /proc/pid/statm
+    /// 0. **size** (%d) - Total program size
+    /// 1. **rss** (%d) - Resident set Size
     fn read_proc_stat(&self, pid: u32) -> Result<ProcessData> {
         let stat_path = format!("/proc/{}/stat", pid);
+        let statm_path = format!("/proc/{}/statm", pid);
         let stat = std::fs::read_to_string(stat_path).into_diagnostic()?;
-        let fields: Vec<&str> = stat.split_whitespace().collect();
-        if fields.len() >= 20 {
+        let statm = std::fs::read_to_string(statm_path).into_diagnostic()?;
+
+        let fields_stat: Vec<&str> = stat.split_whitespace().collect();
+        let fields_statm: Vec<&str> = statm.split_whitespace().collect();
+        if fields_stat.len() >= 22 && fields_statm.len() >= 6 {
             // Unpack values
-            let (memory, virtual_memory, state, name, start_time) = match (
-                fields[23].parse::<u64>(), // rss
-                fields[22].parse::<u64>(), // vsize
-                fields.get(2),             // state
-                fields.get(1),             // name
-                fields[21].parse::<u64>(), // starttime
+            let (state, name, start_time) = match (
+                fields_stat.get(2),             // state
+                fields_stat.get(1),             // name
+                fields_stat[21].parse::<u64>(), // starttime
             ) {
-                (Ok(memory), Ok(virtual_memory), Some(state), Some(name), Ok(start_time)) => (
-                    memory.saturating_mul(_SC_PAGESIZE as u64),
-                    virtual_memory,
-                    state.to_string(),
-                    name.to_string(),
-                    start_time,
-                ),
-                _ => Err(miette!("Invalid /proc/stat file for {pid}"))?,
+                (Some(state), Some(name), Ok(start_time)) => {
+                    (state.to_string(), name.to_string(), start_time)
+                }
+                _ => Err(miette!("Invalid /proc/{pid}/stat file"))?,
             };
+
+            let (vsize, rss) = match (
+                fields_statm[0].parse::<u64>(), // size
+                fields_statm[1].parse::<u64>(), // rss
+            ) {
+                (Ok(vsize), Ok(rss)) => (vsize, rss),
+                _ => Err(miette!("Invalid /proc/{pid}/statm file"))?,
+            };
+
             let (start_time, run_time) = self.calculate_process_time(start_time);
+            // Rss is stored in number of pages
+            let memory = rss.saturating_mul(self.static_info.page_size);
+
             let cmd = "".to_string();
             Ok(ProcessData {
                 memory,
-                virtual_memory,
+                virtual_memory: vsize,
                 cmd,
                 state,
                 name,
@@ -756,15 +706,50 @@ impl UnixSystem {
         }
     }
 
-    fn calculate_process_time(&self, process_start_time: u64) -> (u64, u64) {
-        let start_time_witout_boot_time: u64 = process_start_time / _SC_CLK_TCK as u64;
-
-        let start_time = self.static_info.boot_time + start_time_witout_boot_time;
-        let now_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+    /// Calculates the absolute start time and total runtime for a process.
+    ///
+    /// This function converts the process start time from the kernel's internal representation
+    /// (clock ticks since system boot) to useful absolute timestamps and runtime duration.
+    ///
+    /// # Arguments
+    ///
+    /// * `start_time_after_boot_in_cycles` - The process start time in clock ticks since system boot,
+    ///   as reported by field 22 (`starttime`) in `/proc/pid/stat`.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    /// * `start_time` - Absolute process start time as seconds since Unix epoch (UTC)
+    /// * `run_time` - Total process runtime in seconds from start until now
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Convert clock ticks to seconds by dividing by `_SC_CLK_TCK` (system clock ticks per second)
+    /// 2. Add system boot time to get absolute start time since Unix epoch
+    /// 3. Calculate runtime as difference between current time and start time
+    ///
+    /// # Example
+    ///
+    /// If a process started 1000 clock ticks after boot, with `_SC_CLK_TCK = 100`,
+    /// and system boot time was 1609459200 (Unix timestamp):
+    /// - start_time_seconds = 1000 / 100 = 10 seconds after boot
+    /// - absolute_start_time = 1609459200 + 10 = 1609459210
+    /// - If current time is 1609459250, runtime = 1609459250 - 1609459210 = 40 seconds
+    ///
+    /// # Notes
+    ///
+    /// - Uses `saturating_sub` for runtime calculation to prevent underflow in edge cases
+    /// - Relies on system boot time being correctly determined from `/proc/stat` btime field
+    /// - Compatible with Linux kernel 2.6+ where starttime is expressed in clock ticks
+    fn calculate_process_time(&self, start_time_after_boot_in_cycles: u64) -> (u64, u64) {
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
             .as_secs();
-        let run_time = now_epoch - start_time;
+        let start_time_without_boot_time: u64 =
+            start_time_after_boot_in_cycles / self.static_info.clock_tick;
+        let start_time = self.static_info.boot_time_secs + start_time_without_boot_time;
+        let run_time = now_epoch.saturating_sub(start_time);
         (start_time, run_time)
     }
 
@@ -821,7 +806,7 @@ impl UnixSystem {
     /// # Returns
     /// * `bool` - Returns true if the process is dead, zombied, or doesn't exist (None).
     ///           Returns false if the process exists and is in any other state.
-    fn is_proc_dead(process: Option<&sysinfo::Process>) -> bool {
+    fn _is_proc_dead(process: Option<&sysinfo::Process>) -> bool {
         match process {
             Some(proc)
                 if vec![ProcessStatus::Dead, ProcessStatus::Zombie].contains(&proc.status()) =>
@@ -948,7 +933,7 @@ impl UnixSystem {
         );
 
         // Return none if the session owner has already finished or died
-        if Self::is_proc_dead(sysinfo.process(session_pid)) {
+        if Self::_is_proc_dead(sysinfo.process(session_pid)) {
             return None;
         }
         // If session owner is still alive, iterate over the session and calculate memory
@@ -969,7 +954,7 @@ impl UnixSystem {
                         );
 
                         match sysinfo.process(Pid::from(pid.clone() as usize)) {
-                            Some(proc) if !Self::is_proc_dead(Some(proc)) => {
+                            Some(proc) if !Self::_is_proc_dead(Some(proc)) => {
                                 // Confirm this is a proc and not a thread
                                 let start_time_str = DateTime::<Local>::from(
                                     UNIX_EPOCH + Duration::from_secs(proc.start_time()),
@@ -1040,7 +1025,7 @@ impl SystemManager for UnixSystem {
             total_swap: self.static_info.total_swap,
             num_sockets: self.static_info.num_sockets,
             cores_per_socket: self.static_info.cores_per_socket,
-            boot_time: self.static_info.boot_time as u32,
+            boot_time: self.static_info.boot_time_secs as u32,
             tags: self.static_info.tags.clone(),
             available_memory: dinamic_stat.available_memory,
             free_swap: dinamic_stat.free_swap,
@@ -1299,6 +1284,7 @@ mod tests {
 
     use dashmap::{DashMap, DashSet};
     use itertools::Itertools;
+    use libc::{_SC_CLK_TCK, _SC_PAGESIZE};
     use opencue_proto::host::HardwareState;
     use uuid::Uuid;
 
@@ -1425,7 +1411,7 @@ mod tests {
         assert_eq!(Some(&"centos".to_string()), stat.attributes.get("SP_OS"));
 
         // boot time
-        assert_eq!(1720194269, static_info.boot_time);
+        assert_eq!(1720194269, static_info.boot_time_secs);
     }
 
     #[test]
@@ -1996,6 +1982,144 @@ mod tests {
         assert_eq!(static_info.hostname, "test");
     }
 
+    #[test]
+    fn test_calculate_process_time_basic() {
+        let system = setup_test_system(4, 2, 1);
+
+        // Mock scenario: process started 1000 clock ticks after boot
+        // Assuming _SC_CLK_TCK = 100 (typical value)
+        let clock_ticks = 1000_u64;
+        let expected_seconds_after_boot =
+            clock_ticks / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+
+        let (start_time, run_time) = system.calculate_process_time(clock_ticks);
+
+        // start_time should be boot_time + seconds_after_boot
+        let expected_start_time = system.static_info.boot_time_secs + expected_seconds_after_boot;
+        assert_eq!(start_time, expected_start_time);
+
+        // run_time should be reasonable (test system has boot_time_secs = 0, so run_time will be large)
+        // Just verify it's a finite value and greater than expected_seconds_after_boot
+        assert!(run_time > expected_seconds_after_boot);
+        assert!(run_time < u64::MAX);
+    }
+
+    #[test]
+    fn test_calculate_process_time_zero_start() {
+        let system = setup_test_system(4, 2, 1);
+
+        // Process that started exactly at boot (0 clock ticks)
+        let (start_time, run_time) = system.calculate_process_time(0);
+
+        // start_time should equal boot_time_secs
+        assert_eq!(start_time, system.static_info.boot_time_secs);
+
+        // run_time should be reasonable (test system has boot_time_secs = 0, so run_time will be current epoch time)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        assert!(run_time > 0);
+        assert!(run_time <= now); // Should not exceed current time
+    }
+
+    #[test]
+    fn test_calculate_process_time_large_value() {
+        let system = setup_test_system(4, 2, 1);
+
+        // Test with a large number of clock ticks
+        let clock_ticks = 1_000_000_u64;
+        let expected_seconds_after_boot =
+            clock_ticks / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+
+        let (start_time, run_time) = system.calculate_process_time(clock_ticks);
+
+        let expected_start_time = system.static_info.boot_time_secs + expected_seconds_after_boot;
+        assert_eq!(start_time, expected_start_time);
+
+        // For a process that started far in the past, run_time should be reasonable
+        // (we can't predict exact values due to real system time, but it should be finite)
+        assert!(run_time < u64::MAX);
+    }
+
+    #[test]
+    fn test_calculate_process_time_consistency() {
+        let system = setup_test_system(4, 2, 1);
+
+        let clock_ticks_1 = 500_u64;
+        let clock_ticks_2 = 1000_u64;
+
+        let (start_time_1, _) = system.calculate_process_time(clock_ticks_1);
+        let (start_time_2, _) = system.calculate_process_time(clock_ticks_2);
+
+        // Process 2 should have started later than process 1
+        assert!(start_time_2 > start_time_1);
+
+        // The difference should match the expected clock tick difference
+        let expected_diff =
+            (clock_ticks_2 - clock_ticks_1) / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        let actual_diff = start_time_2 - start_time_1;
+        assert_eq!(actual_diff, expected_diff);
+    }
+
+    #[test]
+    fn test_calculate_process_time_edge_case_max_value() {
+        let system = setup_test_system(4, 2, 1);
+
+        // Test with maximum reasonable value
+        let clock_ticks = u64::MAX / 2; // Avoid overflow in calculations
+        let (start_time, run_time) = system.calculate_process_time(clock_ticks);
+
+        // Should not panic or overflow
+        assert!(start_time >= system.static_info.boot_time_secs);
+        // run_time uses saturating_sub, so it should never overflow
+        assert!(run_time <= u64::MAX);
+    }
+
+    #[test]
+    fn test_calculate_process_time_runtime_calculation() {
+        let mut system = setup_test_system(4, 2, 1);
+
+        // Set a known boot time for predictable testing
+        system.static_info.boot_time_secs = 1609459200; // 2021-01-01 00:00:00 UTC
+
+        // Process started 10 seconds after boot (1000 clock ticks assuming 100 Hz)
+        let clock_ticks = 1000_u64;
+        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        let expected_start_time = system.static_info.boot_time_secs + (clock_ticks / clk_tck);
+
+        let (start_time, run_time) = system.calculate_process_time(clock_ticks);
+
+        assert_eq!(start_time, expected_start_time);
+
+        // run_time should be the difference between now and start_time
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let expected_run_time = now.saturating_sub(start_time);
+        assert_eq!(run_time, expected_run_time);
+    }
+
+    #[test]
+    fn test_calculate_process_time_multiple_calls_consistent() {
+        let system = setup_test_system(4, 2, 1);
+
+        let clock_ticks = 5000_u64;
+
+        // Multiple calls with same input should produce same start_time
+        let (start_time_1, run_time_1) = system.calculate_process_time(clock_ticks);
+        std::thread::sleep(std::time::Duration::from_millis(10)); // Small delay
+        let (start_time_2, run_time_2) = system.calculate_process_time(clock_ticks);
+
+        // Start time should be identical
+        assert_eq!(start_time_1, start_time_2);
+
+        // Run time should be slightly different (or same if calls were very fast)
+        assert!(run_time_2 >= run_time_1);
+        assert!(run_time_2 - run_time_1 <= 1); // Should differ by at most 1 second
+    }
+
     // Helper function to create a test system with specified configuration
     fn setup_test_system(
         total_cores: u32,
@@ -2039,8 +2163,10 @@ mod tests {
                 num_sockets: physical_cpus,
                 cores_per_socket: cores_per_cpu,
                 hyperthreading_multiplier: 1,
-                boot_time: 0,
+                boot_time_secs: 0,
                 tags: vec![],
+                page_size: unsafe { libc::sysconf(_SC_PAGESIZE) as u64 },
+                clock_tick: unsafe { libc::sysconf(_SC_CLK_TCK) as u64 },
             },
             hardware_state: HardwareState::Up,
             attributes: HashMap::new(),
