@@ -563,7 +563,8 @@ impl RunningFrame {
 
         // Update frame state with frame pid
         let pid = child.id().ok_or(miette!(
-            "Invalid State, trying to get pid of a process that has already terminated"
+            "Failed to get process ID after spawn - \
+            process may have failed to start or already finished"
         ))?;
         self.start(pid);
 
@@ -1087,40 +1088,56 @@ impl RunningFrame {
         raw_stderr_path: String,
         mut stop_flag: tokio::sync::mpsc::Receiver<()>,
     ) -> Result<()> {
-        let stdout_file = tokio::fs::File::open(&raw_stdout_path)
-            .await
-            .into_diagnostic()
-            .wrap_err(format!("Failed to open raw stdout ({raw_stdout_path})"))?;
-        let stderr_file = tokio::fs::File::open(&raw_stderr_path)
-            .await
-            .into_diagnostic()
-            .wrap_err(format!("Failed to open raw stderr ({raw_stderr_path})"))?;
+        let mut stdout_position: u64 = 0;
+        let mut stderr_position: u64 = 0;
+        let mut last_stdout_refresh = SystemTime::now();
+        let mut last_stderr_refresh = SystemTime::now();
 
-        let mut stdout_lines = tokio::io::BufReader::new(stdout_file).lines();
-        let mut stderr_lines = tokio::io::BufReader::new(stderr_file).lines();
+        // Refresh readers every 5 seconds to catch new data after EOF
+        let refresh_interval = Duration::from_secs(5);
 
         let mut stdout_interval = time::interval(Duration::from_millis(300));
         let mut stderr_interval = time::interval(Duration::from_millis(500));
+
         loop {
             tokio::select! {
                 _ = stdout_interval.tick() => {
-                    while let Ok(Some(line)) = stdout_lines.next_line().await {
-                        logger.writeln(&line);
+                    let now = SystemTime::now();
+                    let should_refresh = now.duration_since(last_stdout_refresh)
+                        .unwrap_or(Duration::ZERO) >= refresh_interval;
+
+                    stdout_position = Self::read_log_lines(
+                        &raw_stdout_path,
+                        stdout_position,
+                        &logger,
+                        should_refresh,
+                    ).await.unwrap_or(stdout_position);
+
+                    if should_refresh {
+                        last_stdout_refresh = now;
                     }
                 }
                 _ = stderr_interval.tick() => {
-                    while let Ok(Some(line)) = stderr_lines.next_line().await {
-                        logger.writeln(&line);
+                    let now = SystemTime::now();
+                    let should_refresh = now.duration_since(last_stderr_refresh)
+                        .unwrap_or(Duration::ZERO) >= refresh_interval;
+
+                    stderr_position = Self::read_log_lines(
+                        &raw_stderr_path,
+                        stderr_position,
+                        &logger,
+                        should_refresh,
+                    ).await.unwrap_or(stderr_position);
+
+                    if should_refresh {
+                        last_stderr_refresh = now;
                     }
                 }
                 _ = stop_flag.recv() => {
-                    // Drain both buffers before exiting
-                    while let Ok(Some(line)) = stdout_lines.next_line().await {
-                        logger.writeln(&line);
-                    }
-                    while let Ok(Some(line)) = stderr_lines.next_line().await {
-                        logger.writeln(&line);
-                    }
+                    // Final drain of both log files
+                    let _ = Self::read_log_lines(&raw_stdout_path, stdout_position, &logger, true).await;
+                    let _ = Self::read_log_lines(&raw_stderr_path, stderr_position, &logger, true).await;
+
                     // Remove temporary files
                     let _ = tokio::fs::remove_file(raw_stdout_path).await;
                     let _ = tokio::fs::remove_file(raw_stderr_path).await;
@@ -1129,6 +1146,51 @@ impl RunningFrame {
             }
         }
         Ok(())
+    }
+
+    async fn read_log_lines(
+        path: &str,
+        start_position: u64,
+        logger: &FrameLogger,
+        force_reopen: bool,
+    ) -> Result<u64> {
+        use tokio::io::{AsyncSeekExt, SeekFrom};
+
+        // Check if file exists and get its current size
+        let metadata = match tokio::fs::metadata(path).await {
+            Ok(meta) => meta,
+            Err(_) => return Ok(start_position), // File doesn't exist yet
+        };
+
+        let file_size = metadata.len();
+
+        // If file hasn't grown and we're not forcing a reopen, nothing to read
+        if file_size <= start_position && !force_reopen {
+            return Ok(start_position);
+        }
+
+        // Open file and seek to our last position
+        let mut file = match tokio::fs::File::open(path).await {
+            Ok(f) => f,
+            Err(_) => return Ok(start_position), // Can't open file
+        };
+
+        if file.seek(SeekFrom::Start(start_position)).await.is_err() {
+            return Ok(start_position);
+        }
+
+        let reader = tokio::io::BufReader::new(file);
+        let mut lines = reader.lines();
+        let mut current_position = start_position;
+
+        // Read all available lines
+        while let Ok(Some(line)) = lines.next_line().await {
+            logger.writeln(&line);
+            // Estimate position (this is approximate but sufficient for our needs)
+            current_position += line.len() as u64 + 1; // +1 for newline
+        }
+
+        Ok(current_position)
     }
 
     fn snapshot_path(&self) -> Result<String> {
