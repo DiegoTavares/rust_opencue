@@ -21,6 +21,8 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+#[cfg(target_os = "macos")]
+use crate::system::macos::MacOsSystem;
 use crate::{
     config::config::{Config, MachineConfig},
     frame::{
@@ -31,8 +33,8 @@ use crate::{
 };
 
 use super::{
+    linux::LinuxSystem,
     manager::{ReservationError, SystemManagerType},
-    unix::UnixSystem,
 };
 
 /// Constantly monitor the state of this machine and report back to Cuebot
@@ -68,8 +70,15 @@ impl MachineMonitor {
     /// Initializes the object without starting the monitor loop
     /// Will gather the initial state of this machine
     pub fn init(config: &Config, report_client: Arc<ReportClient>) -> Result<Self> {
-        let system_manager: SystemManagerType = Box::new(UnixSystem::init(&config.machine)?);
-        // TODO: identify which OS is running and initialize system_manager accordingly
+        // Use a combination of debug assertions and target_os to ensure both versions are compiled at
+        // debug mode
+        #[cfg(any(target_os = "macos", all(debug_assertions)))]
+        #[allow(unused_variables)]
+        let system_manager: SystemManagerType = Box::new(MacOsSystem::init(&config.machine)?);
+
+        #[cfg(any(target_os = "linux", all(debug_assertions)))]
+        let system_manager: SystemManagerType = Box::new(LinuxSystem::init(&config.machine)?);
+
         Ok(Self {
             maching_config: config.machine.clone(),
             report_client,
