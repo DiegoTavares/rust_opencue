@@ -631,7 +631,7 @@ impl UnixSystem {
                         && is_group_leader
                         && valid_state
                     {
-                        if let Ok(process_data) = self.read_proc_stat(pid) {
+                        if let Ok(process_data) = self.read_proc_data(pid) {
                             self.cached_processes.insert(pid, process_data);
                             self.session_processes
                                 .entry(session_id)
@@ -658,11 +658,15 @@ impl UnixSystem {
     /// ## /proc/pid/statm
     /// 0. **size** (%d) - Total program size
     /// 1. **rss** (%d) - Resident set Size
-    fn read_proc_stat(&self, pid: u32) -> Result<ProcessData> {
+    ///
+    /// ## /proc/pid/cmdline
+    fn read_proc_data(&self, pid: u32) -> Result<ProcessData> {
         let stat_path = format!("/proc/{}/stat", pid);
         let statm_path = format!("/proc/{}/statm", pid);
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
         let stat = std::fs::read_to_string(stat_path).into_diagnostic()?;
         let statm = std::fs::read_to_string(statm_path).into_diagnostic()?;
+        let cmdline = std::fs::read_to_string(cmdline_path).into_diagnostic()?;
 
         let fields_stat: Vec<&str> = stat.split_whitespace().collect();
         let fields_statm: Vec<&str> = statm.split_whitespace().collect();
@@ -690,11 +694,20 @@ impl UnixSystem {
             let (start_time, run_time) = self.calculate_process_time(start_time);
             // Rss is stored in number of pages
             let memory = rss.saturating_mul(self.static_info.page_size);
+            let virtual_memory = vsize.saturating_mul(self.static_info.page_size);
 
-            let cmd = "".to_string();
+            // Remove ()
+            let name = if name.len() > 2 {
+                name[1..name.len() - 2].to_string()
+            } else {
+                name
+            };
+
+            let cmd = cmdline.replace('\0', " ");
+
             Ok(ProcessData {
                 memory,
-                virtual_memory: vsize,
+                virtual_memory,
                 cmd,
                 state,
                 name,
@@ -721,26 +734,6 @@ impl UnixSystem {
     /// A tuple containing:
     /// * `start_time` - Absolute process start time as seconds since Unix epoch (UTC)
     /// * `run_time` - Total process runtime in seconds from start until now
-    ///
-    /// # Algorithm
-    ///
-    /// 1. Convert clock ticks to seconds by dividing by `_SC_CLK_TCK` (system clock ticks per second)
-    /// 2. Add system boot time to get absolute start time since Unix epoch
-    /// 3. Calculate runtime as difference between current time and start time
-    ///
-    /// # Example
-    ///
-    /// If a process started 1000 clock ticks after boot, with `_SC_CLK_TCK = 100`,
-    /// and system boot time was 1609459200 (Unix timestamp):
-    /// - start_time_seconds = 1000 / 100 = 10 seconds after boot
-    /// - absolute_start_time = 1609459200 + 10 = 1609459210
-    /// - If current time is 1609459250, runtime = 1609459250 - 1609459210 = 40 seconds
-    ///
-    /// # Notes
-    ///
-    /// - Uses `saturating_sub` for runtime calculation to prevent underflow in edge cases
-    /// - Relies on system boot time being correctly determined from `/proc/stat` btime field
-    /// - Compatible with Linux kernel 2.6+ where starttime is expressed in clock ticks
     fn calculate_process_time(&self, start_time_after_boot_in_cycles: u64) -> (u64, u64) {
         let now_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
