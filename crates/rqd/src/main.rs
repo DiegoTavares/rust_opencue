@@ -74,6 +74,9 @@ async fn async_main(config: Config) -> miette::Result<()> {
     // Await for the confirmation machine_monitor has fully initialized
     let _machine_monitor_started = rx.await;
 
+    // Recovering frames is unstable on linux. Launched frames are somehow still bound
+    // to the rqd process and receive a kill signal when rqd stops
+    #[cfg(target_os = "macos")]
     if let Err(err) = frame_manager.recover_snapshots().await {
         warn!("Failed to recover frames from snapshot: {}", err);
     };
